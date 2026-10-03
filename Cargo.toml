@@ -1,0 +1,28 @@
+[package]
+name = "gcs-rust-fs"
+version = "0.1.0"
+edition = "2021"
+# Pinned to the MSRV of the google-cloud-storage SDK.
+rust-version = "1.91"
+description = "Non-POSIX, pure-Rust file-system primitives for Google Cloud Storage built on the official Rust storage SDK."
+license = "Apache-2.0"
+repository = "https://github.com/raj-prince/gcs-rust-fs"
+readme = "README.md"
+keywords = ["gcs", "google-cloud-storage", "filesystem", "fsspec", "gcsfs"]
+categories = ["filesystem", "api-bindings", "asynchronous"]
+
+[lib]
+name = "gcs_rust_fs"
+path = "src/lib.rs"
+
+[dependencies]
+google-cloud-storage = "1"
+# Only used for the canonical gRPC status codes when classifying SDK errors.
+google-cloud-gax = "1"
+tokio = { version = "1", features = ["sync", "macros"] }
+bytes = "1"
+base64 = "0.22"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
