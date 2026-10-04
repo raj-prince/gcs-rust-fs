@@ -19,7 +19,12 @@ path = "src/lib.rs"
 google-cloud-storage = "1"
 # Only used for the canonical gRPC status codes when classifying SDK errors.
 google-cloud-gax = "1"
-tokio = { version = "1", features = ["sync", "macros"] }
+# `FileSystem` / `File` are object-safe async traits (Arc<dyn FileSystem>,
+# Box<dyn File>) so the bridge can pick an implementation at runtime.
+async-trait = "0.1"
+# Bounded concurrency for the derived bulk operations (cat, rm, copy, put).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["sync", "macros", "fs", "io-util"] }
 bytes = "1"
 base64 = "0.22"
 tracing = "0.1"

@@ -9,7 +9,28 @@
 //! and reused by any Rust application. A thin PyO3 bridge (living in `gcsfs`)
 //! converts the types below into Python objects.
 //!
-//! ## Operations
+//! ## Architecture
+//!
+//! The crate is split into a storage-agnostic **contract** and a Google Cloud
+//! Storage **implementation**:
+//!
+//! | Layer | Items | Knows about |
+//! |-------|-------|-------------|
+//! | contract | [`FileSystem`], [`File`], [`Entry`], option structs | paths, bytes, directories, errors |
+//! | derived operations | default methods of [`FileSystem`] (`find`, `glob`, `walk`, `rm`, `copy`, ...) | only the six required primitives |
+//! | implementation | [`GcsFs`], [`GcsFile`], [`Transport`] | buckets, generations, gRPC / JSON API |
+//!
+//! [`FileSystem`] is the Rust counterpart of `fsspec`'s `AbstractFileSystem`
+//! and [`File`] of its `AbstractBufferedFile`. Both are object-safe async
+//! traits, so a language bridge can hold an `Arc<dyn FileSystem>` and a
+//! `Box<dyn File>` and pick the implementation at runtime. Implementors use
+//! the re-exported [`macro@async_trait`] attribute.
+//!
+//! > **Status:** the traits and their derived operations are complete;
+//! > [`GcsFs`] / [`GcsFile`] currently expose the read-only subset through
+//! > inherent methods and do not implement the traits yet.
+//!
+//! ## Operations available today
 //!
 //! | Operation | Entry points | Wire protocol |
 //! |-----------|--------------|---------------|
@@ -49,7 +70,9 @@
 //! Every error carries an [`ErrorKind`] so callers can react without parsing
 //! strings. A Python bridge would typically map `NotFound` →
 //! `FileNotFoundError`, `PermissionDenied` → `PermissionError`,
-//! `InvalidPath`/`InvalidRange` → `ValueError`, everything else → `OSError`.
+//! `IsADirectory` / `NotADirectory` / `AlreadyExists` / `DirectoryNotEmpty` →
+//! the matching `OSError` subclass, `InvalidPath`/`InvalidRange` →
+//! `ValueError`, everything else → `OSError`.
 //!
 //! ## Authentication
 //!
@@ -59,22 +82,45 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod derived;
+mod entry;
 mod error;
 mod file;
-mod fs;
+mod filesystem;
+mod gcs;
+mod glob;
+mod options;
 mod path;
 mod range;
 mod stat;
 
+pub use entry::{DiskUsage, Entry, EntryKind, WalkEntry};
 pub use error::{classify_storage_error, Error, ErrorKind, Result, StorageError};
-pub use file::GcsFile;
-pub use fs::{GcsFs, GcsFsBuilder, Transport};
+pub use file::File;
+pub use filesystem::FileSystem;
+pub use gcs::{GcsFile, GcsFs, GcsFsBuilder, Transport};
+pub use options::{
+    BulkOptions, CopyOptions, DuOptions, FindOptions, GlobOptions, ListOptions, MkdirOptions,
+    OnError, OpenMode, OpenOptions, PutOptions, RmOptions, WalkOptions, WriteMode, WriteOptions,
+    DEFAULT_CONCURRENCY,
+};
 pub use path::GcsPath;
 pub use range::ByteRange;
 pub use stat::ObjectStat;
 
+/// The attribute macro that [`FileSystem`] and [`File`] are declared with.
+///
+/// Implementations must annotate their `impl` blocks with it too:
+///
+/// ```ignore
+/// #[gcs_rust_fs::async_trait]
+/// impl gcs_rust_fs::FileSystem for MyFs { /* ... */ }
+/// ```
+pub use async_trait::async_trait;
+
 /// Re-export of the SDK crate this library is built on, so downstream code can
-/// name SDK types (e.g. for [`GcsFs::storage`]) without a separate dependency.
+/// inspect [`StorageError`] details (via [`Error::storage_source`]) without a
+/// separate dependency.
 pub use google_cloud_storage as sdk;
 
 use bytes::Bytes;

@@ -110,6 +110,37 @@ impl ByteRange {
         }
     }
 
+    /// Resolve the range against a known object `size` into concrete
+    /// `[start, end)` offsets, exactly like a Python slice: negative bounds
+    /// count back from the end, bounds beyond the object are truncated, and
+    /// an empty or inverted range yields `start == end`.
+    ///
+    /// This is what a [`File::read_range`](crate::File::read_range)
+    /// implementation applies once it knows the size of its file.
+    ///
+    /// ```
+    /// use gcs_rust_fs::ByteRange;
+    ///
+    /// assert_eq!(ByteRange::ALL.clamp(10), 0..10);
+    /// assert_eq!(ByteRange::span(2, 50).clamp(10), 2..10);
+    /// assert_eq!(ByteRange::tail(3).clamp(10), 7..10);
+    /// assert_eq!(ByteRange::new(Some(-4), Some(-2)).clamp(10), 6..8);
+    /// assert_eq!(ByteRange::span(20, 30).clamp(10), 10..10);
+    /// ```
+    pub fn clamp(&self, size: u64) -> std::ops::Range<u64> {
+        let sz = clamp_i64(size);
+        let normalise = |bound: i64| -> i64 {
+            if bound >= 0 {
+                bound.min(sz)
+            } else {
+                (sz + bound).max(0)
+            }
+        };
+        let start = normalise(self.start.unwrap_or(0));
+        let end = normalise(self.end.unwrap_or(sz)).max(start);
+        start as u64..end as u64
+    }
+
     /// Resolve into a concrete request.
     ///
     /// When `size` is known the range is clamped exactly like a Python slice:

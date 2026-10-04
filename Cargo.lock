@@ -491,8 +491,10 @@ dependencies = [
 name = "gcs-rust-fs"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bytes",
+ "futures-util",
  "google-cloud-gax",
  "google-cloud-storage",
  "tokio",

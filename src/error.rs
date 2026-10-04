@@ -22,13 +22,33 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// The mapping to transport-level failures is:
 ///
-/// | `ErrorKind`        | HTTP (JSON API) | gRPC status         |
-/// |--------------------|-----------------|---------------------|
-/// | `NotFound`         | 404             | `NOT_FOUND`         |
-/// | `PermissionDenied` | 403             | `PERMISSION_DENIED` |
-/// | `Unauthenticated`  | 401             | `UNAUTHENTICATED`   |
-/// | `OutOfRange`       | 416             | `OUT_OF_RANGE`      |
-/// | `Timeout`          | 408 / 504       | `DEADLINE_EXCEEDED` |
+/// | `ErrorKind`          | HTTP (JSON API) | gRPC status           |
+/// |----------------------|-----------------|-----------------------|
+/// | `NotFound`           | 404             | `NOT_FOUND`           |
+/// | `PermissionDenied`   | 403             | `PERMISSION_DENIED`   |
+/// | `Unauthenticated`    | 401             | `UNAUTHENTICATED`     |
+/// | `OutOfRange`         | 416             | `OUT_OF_RANGE`        |
+/// | `Timeout`            | 408 / 504       | `DEADLINE_EXCEEDED`   |
+/// | `AlreadyExists`      | —               | `ALREADY_EXISTS`      |
+/// | `PreconditionFailed` | 412             | `FAILED_PRECONDITION` |
+/// | `Unsupported`        | 501             | `UNIMPLEMENTED`       |
+///
+/// The remaining kinds are produced by the file-system layer itself (path and
+/// range validation, directory emulation, handle state) rather than by the
+/// service. A Python bridge would map them as follows:
+///
+/// | `ErrorKind`                      | Python exception          |
+/// |----------------------------------|---------------------------|
+/// | `NotFound`                       | `FileNotFoundError`       |
+/// | `PermissionDenied`               | `PermissionError`         |
+/// | `IsADirectory`                   | `IsADirectoryError`       |
+/// | `NotADirectory`                  | `NotADirectoryError`      |
+/// | `AlreadyExists`                  | `FileExistsError`         |
+/// | `DirectoryNotEmpty`              | `OSError(ENOTEMPTY)`      |
+/// | `InvalidPath` / `InvalidRange`   | `ValueError`              |
+/// | `Closed`                         | `ValueError`              |
+/// | `Unsupported`                    | `NotImplementedError`     |
+/// | anything else                    | `OSError`                 |
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -52,6 +72,23 @@ pub enum ErrorKind {
     ClientInit,
     /// [`init_shared`](crate::init_shared) was called more than once.
     AlreadyInitialized,
+    /// A file operation was attempted on a directory (e.g. `cat_file`,
+    /// `rm_file`, or a non-recursive `rm` on a directory).
+    IsADirectory,
+    /// A directory operation was attempted on a file (e.g. `rmdir` on a file).
+    NotADirectory,
+    /// The target already exists and the operation was asked not to overwrite
+    /// it (create-only writes, creating an existing bucket).
+    AlreadyExists,
+    /// `rmdir` was asked to remove a directory that still has content.
+    DirectoryNotEmpty,
+    /// A generation / metageneration precondition did not hold.
+    PreconditionFailed,
+    /// The operation is not supported by this file system, transport or
+    /// handle mode (e.g. `write` on a read handle, append mode).
+    Unsupported,
+    /// I/O was attempted on a closed [`File`](crate::File).
+    Closed,
     /// Any other failure reported by the service or the transport.
     Other,
 }
@@ -70,6 +107,13 @@ impl ErrorKind {
             ErrorKind::Timeout => "timeout",
             ErrorKind::ClientInit => "client_init",
             ErrorKind::AlreadyInitialized => "already_initialized",
+            ErrorKind::IsADirectory => "is_a_directory",
+            ErrorKind::NotADirectory => "not_a_directory",
+            ErrorKind::AlreadyExists => "already_exists",
+            ErrorKind::DirectoryNotEmpty => "directory_not_empty",
+            ErrorKind::PreconditionFailed => "precondition_failed",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::Closed => "closed",
             ErrorKind::Other => "other",
         }
     }
@@ -95,7 +139,13 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+    /// An error of the given kind with a free-form message.
+    ///
+    /// Implementations of [`FileSystem`](crate::FileSystem) and
+    /// [`File`](crate::File) outside this crate use this (and the more
+    /// specific constructors below) to report failures with the
+    /// classification the derived operations rely on.
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -103,7 +153,9 @@ impl Error {
         }
     }
 
-    pub(crate) fn with_source(
+    /// Like [`Error::new`], additionally recording the underlying cause
+    /// (available through [`std::error::Error::source`]).
+    pub fn with_source(
         kind: ErrorKind,
         message: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -122,7 +174,9 @@ impl Error {
         )
     }
 
-    pub(crate) fn invalid_range(reason: impl Into<String>) -> Self {
+    /// [`ErrorKind::InvalidRange`]: a byte range or depth that cannot be
+    /// resolved (e.g. seeking to a negative position).
+    pub fn invalid_range(reason: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidRange, reason)
     }
 
@@ -136,6 +190,70 @@ impl Error {
             "failed to initialise the Google Cloud Storage client",
             source,
         )
+    }
+
+    /// [`ErrorKind::NotFound`] for `path`.
+    pub fn not_found(path: &str) -> Self {
+        Self::new(ErrorKind::NotFound, format!("{path:?} does not exist"))
+    }
+
+    /// [`ErrorKind::IsADirectory`] for `path`.
+    pub fn is_a_directory(path: &str) -> Self {
+        Self::new(ErrorKind::IsADirectory, format!("{path:?} is a directory"))
+    }
+
+    /// [`ErrorKind::NotADirectory`] for `path`.
+    pub fn not_a_directory(path: &str) -> Self {
+        Self::new(
+            ErrorKind::NotADirectory,
+            format!("{path:?} is not a directory"),
+        )
+    }
+
+    /// [`ErrorKind::AlreadyExists`] for `path`.
+    pub fn already_exists(path: &str) -> Self {
+        Self::new(ErrorKind::AlreadyExists, format!("{path:?} already exists"))
+    }
+
+    /// [`ErrorKind::DirectoryNotEmpty`] for `path`.
+    pub fn directory_not_empty(path: &str) -> Self {
+        Self::new(
+            ErrorKind::DirectoryNotEmpty,
+            format!("directory {path:?} is not empty"),
+        )
+    }
+
+    /// [`ErrorKind::Unsupported`] with a description of the missing feature
+    /// (e.g. `"append mode"`, `"write on a read handle"`).
+    pub fn unsupported(what: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Unsupported, what)
+    }
+
+    /// [`ErrorKind::Closed`]: I/O on a closed handle for `path`.
+    pub fn closed(path: &str) -> Self {
+        Self::new(
+            ErrorKind::Closed,
+            format!("I/O operation on closed file {path:?}"),
+        )
+    }
+
+    /// Wrap a local I/O error raised while performing `op` on `path`,
+    /// classifying it by its [`std::io::ErrorKind`].
+    pub fn io(op: &str, path: impl std::fmt::Display, source: std::io::Error) -> Self {
+        use std::io::ErrorKind as IoKind;
+        let kind = match source.kind() {
+            IoKind::NotFound => ErrorKind::NotFound,
+            IoKind::PermissionDenied => ErrorKind::PermissionDenied,
+            IoKind::AlreadyExists => ErrorKind::AlreadyExists,
+            IoKind::IsADirectory => ErrorKind::IsADirectory,
+            IoKind::NotADirectory => ErrorKind::NotADirectory,
+            IoKind::DirectoryNotEmpty => ErrorKind::DirectoryNotEmpty,
+            IoKind::TimedOut => ErrorKind::Timeout,
+            IoKind::Unsupported => ErrorKind::Unsupported,
+            IoKind::InvalidInput => ErrorKind::InvalidPath,
+            _ => ErrorKind::Other,
+        };
+        Self::with_source(kind, format!("{op} {path} failed ({kind})"), source)
     }
 
     /// Wrap an SDK error raised while performing `op` on `path`, classifying it
@@ -215,8 +333,15 @@ impl From<Error> for std::io::Error {
             ErrorKind::PermissionDenied | ErrorKind::Unauthenticated => IoKind::PermissionDenied,
             ErrorKind::OutOfRange => IoKind::UnexpectedEof,
             ErrorKind::Timeout => IoKind::TimedOut,
-            ErrorKind::AlreadyInitialized => IoKind::AlreadyExists,
-            ErrorKind::ClientInit | ErrorKind::Other => IoKind::Other,
+            ErrorKind::AlreadyInitialized | ErrorKind::AlreadyExists => IoKind::AlreadyExists,
+            ErrorKind::IsADirectory => IoKind::IsADirectory,
+            ErrorKind::NotADirectory => IoKind::NotADirectory,
+            ErrorKind::DirectoryNotEmpty => IoKind::DirectoryNotEmpty,
+            ErrorKind::Unsupported => IoKind::Unsupported,
+            ErrorKind::PreconditionFailed
+            | ErrorKind::Closed
+            | ErrorKind::ClientInit
+            | ErrorKind::Other => IoKind::Other,
         };
         std::io::Error::new(kind, err)
     }
@@ -235,6 +360,9 @@ pub fn classify_storage_error(err: &StorageError) -> ErrorKind {
             Code::Unauthenticated => return ErrorKind::Unauthenticated,
             Code::OutOfRange => return ErrorKind::OutOfRange,
             Code::DeadlineExceeded => return ErrorKind::Timeout,
+            Code::AlreadyExists => return ErrorKind::AlreadyExists,
+            Code::FailedPrecondition => return ErrorKind::PreconditionFailed,
+            Code::Unimplemented => return ErrorKind::Unsupported,
             _ => {}
         }
     }
@@ -244,6 +372,8 @@ pub fn classify_storage_error(err: &StorageError) -> ErrorKind {
         Some(401) => return ErrorKind::Unauthenticated,
         Some(416) => return ErrorKind::OutOfRange,
         Some(408) | Some(504) => return ErrorKind::Timeout,
+        Some(412) => return ErrorKind::PreconditionFailed,
+        Some(501) => return ErrorKind::Unsupported,
         _ => {}
     }
     if err.is_authentication() {

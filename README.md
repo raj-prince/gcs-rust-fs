@@ -9,25 +9,45 @@ has no Python/PyO3 dependency: the storage logic lives here, is tested with
 `cargo test`, and is reusable from any Rust program. A thin PyO3 bridge inside
 `gcsfs` converts the types below into Python objects.
 
+## Architecture
+
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  gcs-rust-fs (this repo — pure Rust, zero Python knowledge)  │
-│                                                              │
-│  GcsFs::stat      → ObjectStat         gRPC GetObject        │
-│  GcsFs::cat_file  → Bytes              gRPC BidiReadObject   │
-│  GcsFs::open      → GcsFile            (or JSON API / HTTP)  │
-│  GcsPath, ByteRange, Error { kind: ErrorKind }               │
-└──────────────────────────────┬───────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  gcs-rust-fs (this repo — pure Rust, zero Python knowledge)          │
+│                                                                      │
+│  contract        trait FileSystem  (≙ fsspec AbstractFileSystem)     │
+│                  trait File        (≙ fsspec AbstractBufferedFile)   │
+│                  Entry, *Options, ByteRange, Error { ErrorKind }     │
+│                        ▲ six required primitives:                    │
+│                        │ info · ls · open · rm_file · mkdir · rmdir  │
+│  derived ops     find walk du glob cat cat_ranges rm copy mv put …   │
+│                  (fsspec semantics, written once, storage-agnostic)  │
+│                        ▲                                             │
+│  implementation  src/gcs/: GcsFs, GcsFile, Transport {Grpc, Http}    │
+│                  (the only code that knows about buckets, gRPC, …)   │
+└──────────────────────────────┬───────────────────────────────────────┘
                                │ Cargo dependency
-┌──────────────────────────────▼───────────────────────────────┐
-│  gcsfs/rust (thin PyO3 bridge, lives in the gcsfs repo)      │
-│  Bytes → PyBytes, ObjectStat → dict, ErrorKind → exceptions  │
-└──────────────────────────────┬───────────────────────────────┘
+┌──────────────────────────────▼───────────────────────────────────────┐
+│  gcsfs/rust (thin PyO3 bridge, lives in the gcsfs repo)              │
+│  Arc<dyn FileSystem> / Box<dyn File>; Bytes → PyBytes,               │
+│  Entry → info dict, ErrorKind → exceptions                           │
+└──────────────────────────────┬───────────────────────────────────────┘
                                │
-┌──────────────────────────────▼───────────────────────────────┐
-│  gcsfs.GCSFileSystem(read_backend="rust")._cat_file/_info    │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────▼───────────────────────────────────────┐
+│  gcsfs.GCSFileSystem(read_backend="rust")                            │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+Both traits are object-safe `async_trait` traits, so the bridge can pick an
+implementation at runtime; `tests/memory_fs.rs` is an in-memory implementation
+that exercises every derived operation without network. The full semantics
+(directory emulation, fsspec copy rules, error classes, open decisions) are in
+[`docs/filesystem_api_design.md`](docs/filesystem_api_design.md).
+
+> **Status:** the contract and derived operations are complete. `GcsFs` /
+> `GcsFile` currently implement the read-only subset below as inherent
+> methods; wiring them to the traits (and adding writes, listing, delete,
+> copy) is the next step.
 
 ## Features
 
