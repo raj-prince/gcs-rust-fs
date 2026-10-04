@@ -70,8 +70,6 @@ pub enum ErrorKind {
     Timeout,
     /// The SDK client could not be constructed (e.g. no credentials found).
     ClientInit,
-    /// [`init_shared`](crate::init_shared) was called more than once.
-    AlreadyInitialized,
     /// A file operation was attempted on a directory (e.g. `cat_file`,
     /// `rm_file`, or a non-recursive `rm` on a directory).
     IsADirectory,
@@ -106,7 +104,6 @@ impl ErrorKind {
             ErrorKind::OutOfRange => "out_of_range",
             ErrorKind::Timeout => "timeout",
             ErrorKind::ClientInit => "client_init",
-            ErrorKind::AlreadyInitialized => "already_initialized",
             ErrorKind::IsADirectory => "is_a_directory",
             ErrorKind::NotADirectory => "not_a_directory",
             ErrorKind::AlreadyExists => "already_exists",
@@ -333,7 +330,7 @@ impl From<Error> for std::io::Error {
             ErrorKind::PermissionDenied | ErrorKind::Unauthenticated => IoKind::PermissionDenied,
             ErrorKind::OutOfRange => IoKind::UnexpectedEof,
             ErrorKind::Timeout => IoKind::TimedOut,
-            ErrorKind::AlreadyInitialized | ErrorKind::AlreadyExists => IoKind::AlreadyExists,
+            ErrorKind::AlreadyExists => IoKind::AlreadyExists,
             ErrorKind::IsADirectory => IoKind::IsADirectory,
             ErrorKind::NotADirectory => IoKind::NotADirectory,
             ErrorKind::DirectoryNotEmpty => IoKind::DirectoryNotEmpty,

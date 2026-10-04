@@ -123,15 +123,6 @@ impl GcsFs {
         Ok(ObjectStat::from(object))
     }
 
-    /// Whether the object (or the given generation of it) exists.
-    pub async fn exists(&self, path: &GcsPath) -> Result<bool> {
-        match self.stat(path).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Read `range` of the object into memory.
     ///
     /// * Empty ranges return empty bytes without a request.

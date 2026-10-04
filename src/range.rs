@@ -58,11 +58,6 @@ impl ByteRange {
         Self { start, end }
     }
 
-    /// The entire object (same as [`ByteRange::ALL`]).
-    pub const fn all() -> Self {
-        Self::ALL
-    }
-
     /// Bytes `[start, end)`.
     pub fn span(start: u64, end: u64) -> Self {
         Self::new(Some(clamp_i64(start)), Some(clamp_i64(end)))

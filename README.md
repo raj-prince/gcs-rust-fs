@@ -53,9 +53,9 @@ that exercises every derived operation without network. The full semantics
 
 | Operation | API | Wire protocol |
 |-----------|-----|---------------|
-| Object metadata | `GcsFs::stat`, `gcs_rust_fs::stat` | gRPC `GetObject` (`StorageControl`) |
-| Ranged read into memory | `GcsFs::cat_file`, `gcs_rust_fs::cat_file` | gRPC `BidiReadObject` **or** JSON API over HTTP (see [Transports](#transports)) |
-| Repeated ranged reads on one generation | `GcsFs::open` → `GcsFile::read_range` / `read_at` | same as above, multiplexed over one bidi stream on gRPC |
+| Object metadata | `GcsFs::stat` | gRPC `GetObject` (`StorageControl`) |
+| Ranged read into memory | `GcsFs::cat_file` | gRPC `BidiReadObject` **or** JSON API over HTTP (see [Transports](#transports)) |
+| Repeated ranged reads on one generation | `GcsFs::open` → `GcsFile::read_range` | same as above, multiplexed over one bidi stream on gRPC |
 
 Design points:
 
@@ -72,8 +72,8 @@ Design points:
   `GCSFileSystem.split_path`.
 * **Snapshot semantics.** `GcsFile` pins the generation observed at open time,
   so concurrent overwrites never produce torn reads.
-* **Shared clients.** `GcsFs` wraps the SDK's pooled clients; build one and
-  clone it, or use the process-wide `gcs_rust_fs::shared()` instance.
+* **No global state.** `GcsFs` wraps the SDK's pooled clients and is cheap to
+  clone; build one instance and share it (the bridge keeps exactly one).
 
 ## Usage
 
@@ -100,21 +100,11 @@ async fn main() -> gcs_rust_fs::Result<()> {
 
     // Repeated reads against one pinned generation:
     let file = fs.open(&path).await?;
-    let chunk = file.read_at(0, 4096).await?;
+    let chunk = file.read_range(ByteRange::head(4096)).await?;
     assert!(chunk.len() <= 4096);
     Ok(())
 }
 ```
-
-The string-based free functions are the shape a foreign-language bridge wants
-(they use the lazily-initialised shared client):
-
-```rust
-let info  = gcs_rust_fs::stat("my-bucket/checkpoint.pt", None).await?;
-let bytes = gcs_rust_fs::cat_file("my-bucket/checkpoint.pt", Some(0), Some(1024), None).await?;
-```
-
-An explicit `generation` argument overrides a `#generation` path suffix.
 
 ## Transports
 
@@ -151,16 +141,15 @@ cargo run --example cat  -- gs://my-bucket/path/to/object --start 0 --end 20
 cargo run --example cat  -- gs://my-bucket/path/to/object --start -100 --transport http
 ```
 
-## Testing
+## Development
 
 ```bash
-cargo test                      # unit tests; live tests self-skip
-GCS_RUST_FS_TEST_OBJECT=gs://my-bucket/file.bin cargo test --test live -- --nocapture
-GCS_RUST_FS_TRANSPORT=http GCS_RUST_FS_TEST_OBJECT=gs://my-bucket/file.bin cargo test --test live
+cargo test                                                # unit + in-memory FS + doctests; live tests self-skip
+GCS_RUST_FS_TEST_OBJECT=gs://my-bucket/file.bin cargo test --test live   # against a real bucket (needs ADC)
 ```
 
-Live tests need Application Default Credentials
-(`gcloud auth application-default login`).
+Building the example binaries, the CI lint gate and the repo layout are in
+[`docs/dev_guide.md`](docs/dev_guide.md).
 
 ## Roadmap
 

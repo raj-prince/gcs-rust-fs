@@ -50,8 +50,6 @@ async fn stat_reports_size_and_generation() {
     let again = fs.stat(&pinned).await.expect("stat by generation");
     assert_eq!(again.generation, stat.generation);
     assert_eq!(again.size, stat.size);
-
-    assert!(fs.exists(&path).await.unwrap());
 }
 
 #[tokio::test]
@@ -113,17 +111,23 @@ async fn open_file_pins_generation_and_clamps_reads() {
     assert_eq!(file.generation(), file.stat().generation);
     assert_eq!(file.path().generation(), Some(file.generation()));
 
-    let all = file.read_all().await.expect("read_all");
+    let all = file.read_range(ByteRange::ALL).await.expect("read all");
     assert_eq!(all.len() as u64, file.size());
 
     let size = file.size();
     if size > 0 {
-        let first = file.read_at(0, 1).await.unwrap();
+        let first = file.read_range(ByteRange::head(1)).await.unwrap();
         assert_eq!(&first[..], &all[..1]);
         // Reading past the end is clamped, never an error.
-        let past = file.read_at(size + 10, 10).await.unwrap();
+        let past = file
+            .read_range(ByteRange::span(size + 10, size + 20))
+            .await
+            .unwrap();
         assert!(past.is_empty());
-        let overlap = file.read_at(size - 1, 100).await.unwrap();
+        let overlap = file
+            .read_range(ByteRange::span(size - 1, size + 100))
+            .await
+            .unwrap();
         assert_eq!(&overlap[..], &all[size as usize - 1..]);
     }
 }
@@ -144,7 +148,6 @@ async fn missing_object_is_not_found() {
         .await
         .expect_err("stat of missing object fails");
     assert_eq!(err.kind(), ErrorKind::NotFound, "{err}");
-    assert!(!fs.exists(&missing).await.unwrap());
 
     let err = fs
         .cat_file(&missing, ByteRange::ALL)
@@ -161,25 +164,16 @@ async fn missing_object_is_not_found() {
 }
 
 #[tokio::test]
-async fn shared_client_free_functions() {
+async fn generation_suffix_in_path_string_is_honoured() {
     let Some(path) = test_path() else { return };
+    let fs = fs().await;
 
-    let uri = path.uri();
-    let stat = gcs_rust_fs::stat(&uri, None).await.expect("shared stat");
-    assert_eq!(stat.name, path.object());
-
-    let bytes = gcs_rust_fs::cat_file(&uri, Some(0), Some(16), None)
-        .await
-        .expect("shared cat_file");
-    assert!(bytes.len() <= 16);
-
-    let pinned = format!("{}#{}", path.relative(), stat.generation);
-    let by_suffix = gcs_rust_fs::stat(&pinned, None)
-        .await
-        .expect("stat via #generation");
+    let stat = fs.stat(&path).await.expect("stat");
+    let pinned: GcsPath = format!("{}#{}", path.relative(), stat.generation)
+        .parse()
+        .expect("path with #generation parses");
+    let by_suffix = fs.stat(&pinned).await.expect("stat via #generation");
     assert_eq!(by_suffix.generation, stat.generation);
-
-    assert!(gcs_rust_fs::exists(&uri, None).await.unwrap());
 }
 
 #[tokio::test]

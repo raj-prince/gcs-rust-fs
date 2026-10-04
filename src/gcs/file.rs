@@ -30,7 +30,7 @@ use crate::stat::ObjectStat;
 /// let fs = GcsFs::new().await?;
 /// let file = fs.open(&GcsPath::parse("gs://my-bucket/data.bin")?).await?;
 /// let footer = file.read_range(ByteRange::tail(64)).await?;
-/// let header = file.read_at(0, 4096).await?;
+/// let header = file.read_range(ByteRange::head(4096)).await?;
 /// println!("{} bytes total", file.size());
 /// # let _ = (footer, header);
 /// # Ok(()) }
@@ -81,16 +81,5 @@ impl GcsFile {
         debug!(path = %self.path, ?range, "read_range");
         let reader = self.handle.read_range(range).await?;
         reader.collect(len_hint, &self.path).await
-    }
-
-    /// Read up to `len` bytes starting at `offset` (the `pread` idiom).
-    pub async fn read_at(&self, offset: u64, len: u64) -> Result<Bytes> {
-        self.read_range(ByteRange::span(offset, offset.saturating_add(len)))
-            .await
-    }
-
-    /// Read the whole object.
-    pub async fn read_all(&self) -> Result<Bytes> {
-        self.read_range(ByteRange::ALL).await
     }
 }

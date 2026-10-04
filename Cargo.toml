@@ -24,7 +24,7 @@ google-cloud-gax = "1"
 async-trait = "0.1"
 # Bounded concurrency for the derived bulk operations (cat, rm, copy, put).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["sync", "macros", "fs", "io-util"] }
+tokio = { version = "1", features = ["macros", "fs", "io-util"] }
 bytes = "1"
 base64 = "0.22"
 tracing = "0.1"

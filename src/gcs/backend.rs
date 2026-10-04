@@ -43,8 +43,8 @@ pub enum Transport {
 
 impl Transport {
     /// Environment variable consulted by
-    /// [`GcsFsBuilder::from_env`](crate::GcsFsBuilder::from_env) and the
-    /// [shared](crate::shared) client. Accepts `grpc` or `http`.
+    /// [`GcsFsBuilder::from_env`](crate::GcsFsBuilder::from_env). Accepts
+    /// `grpc` or `http`.
     pub const ENV_VAR: &'static str = "GCS_RUST_FS_TRANSPORT";
 
     /// The canonical lower-case name (`"grpc"` / `"http"`).
