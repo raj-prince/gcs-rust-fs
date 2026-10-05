@@ -19,6 +19,7 @@
 //! |-------|-------|-------------|
 //! | contract | [`FileSystem`], [`File`], [`Entry`], option structs | paths, bytes, directories, errors |
 //! | derived operations | default methods of [`FileSystem`] (`find`, `glob`, `walk`, `rm`, `copy`, ...) | only the six required primitives |
+//! | decorators | [`CachedFs`] (opt-in `ls`/`info` cache with `fsspec` `dircache` semantics) | any [`FileSystem`] |
 //! | implementation | [`GcsFs`], [`GcsFile`], [`BucketKind`], [`Transport`] | buckets, generations, folders, gRPC / JSON API |
 //!
 //! [`FileSystem`] is the Rust counterpart of `fsspec`'s `AbstractFileSystem`
@@ -75,7 +76,9 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod cached;
 mod derived;
+mod dircache;
 mod entry;
 mod error;
 mod file;
@@ -86,6 +89,7 @@ mod options;
 mod range;
 mod stat;
 
+pub use cached::{CacheConfig, CacheStats, CachedFs};
 pub use entry::{DiskUsage, Entry, EntryKind, WalkEntry};
 pub use error::{classify_storage_error, Error, ErrorKind, Result, StorageError};
 pub use file::File;

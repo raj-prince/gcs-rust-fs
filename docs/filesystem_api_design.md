@@ -21,7 +21,7 @@ Decisions that need your input are marked `D1 … D15` and collected in
 > ([§4](#4-public-api-the-filesystem-and-file-traits)). Their derived
 > operations are implemented generically in [`derived.rs`](../src/derived.rs)
 > and verified against an in-memory implementation in
-> [`tests/memory_fs.rs`](../tests/memory_fs.rs). The GCS types (`GcsFs`,
+> [`tests/common/mod.rs`](../tests/common/mod.rs). The GCS types (`GcsFs`,
 > `GcsFile`) still expose only the original read-only inherent methods and do
 > **not** implement the traits yet — that is the next step, and §5 is its
 > specification.
@@ -44,7 +44,9 @@ Decisions that need your input are marked `D1 … D15` and collected in
 **Non-goals (for now)**
 
 - No PyO3 code here (lives in gcsfs as `gcsfs_bindings`).
-- No directory cache in Rust. fsspec's `dircache` stays in Python (**D1**).
+- No caching inside the backends. A directory/metadata cache exists, but as
+  an opt-in decorator (`CachedFs`, **D30**, revising **D1**) — `GcsFs` itself
+  stays stateless.
 - No ACL/IAM, signed URLs, lifecycle, requester-pays, soft-delete, appendable
   objects. These are GCS features, not filesystem operations.
 - No local disk cache for reads.
@@ -263,6 +265,7 @@ pub trait FileSystem: Send + Sync {
     async fn get_file(&self, path: &str, local: &Path, opts: ReadOptions) -> Result<()>;
     async fn copy_file(&self, src: &str, dst: &str) -> Result<()>;
     async fn move_file(&self, src: &str, dst: &str) -> Result<()>;
+    fn invalidate_cache(&self, path: Option<&str>) {}   // no-op unless wrapped in CachedFs
 
     // Derived operations — encode fsspec semantics once, in derived.rs.
     async fn exists / is_file / is_dir / size(&self, path: &str) -> …;
@@ -296,8 +299,34 @@ What the derived layer guarantees (all verified in `tests/memory_fs.rs`):
 | `put` | same destination rule with the local trailing separator; walks the local tree; `get_file` creates parent directories |
 
 Rules shared by every implementation: `exists` is true for files **and**
-directories; file operations on directories fail with `IsADirectory`; nothing
-is cached in Rust (**D1**).
+directories; file operations on directories fail with `IsADirectory`; backends
+cache nothing — caching is the `CachedFs` decorator's job (**D30**).
+
+### 4.2.1 `CachedFs` — the fsspec `dircache`, for `ls` **and** `info`
+
+`CachedFs<F: FileSystem>` wraps any filesystem and is itself a `FileSystem`,
+so the bridge can hold `Arc<dyn FileSystem>` either way. One store serves both
+read primitives: a `ls` fills a directory node with its complete listing, and
+`info` on any child is then answered from it; an individual `info` result is
+kept in a *partial* node that can never be mistaken for a listing. Eviction is
+per directory node, so a listing is served whole or not at all.
+
+| Aspect | Behaviour | gcsfs/fsspec counterpart |
+|---|---|---|
+| `ls` | miss → store listing; hit → sorted copy. `versions` or a `#gen` path bypasses; `refresh` skips the lookup and replaces the entry | `_ls` / `ls(refresh=True)` |
+| `info` | parent listing → single cached entry → "is a complete directory" → backend; result upserted under its parent | `_info` → parent dircache → `_ls_from_cache` → `_get_object` |
+| negative answers | `CacheConfig::negative` (default **off**): a name absent from a complete listing is `NotFound` without a request | fsspec `_ls_from_cache` raises `FileNotFoundError` (always on) |
+| `find` | `withdirs && maxdepth.is_none() && !versions` fills every directory visited | `_find(update_cache=True)` when `prefix == ""` |
+| writes (`pipe_file`, `put_file`, `copy_file`, `mkdir`, `move_file` dst, write handles at `open` **and** `close`) | parent cached → drop the parent only; else drop the parent and all ancestors (an implicit directory may have appeared) | `DirCacheUpdater._write_file_cache_update` |
+| deletes / trees (`rm_file`, `rmdir`, `rm`, `mv`, `copy` dst, `put`, `move_file` src) | drop the subtree, then the parent and all ancestors | `_rm_files_cache_update`, `_mv_file_cache_update` |
+| `invalidate_cache(Some(p))` / `None` | drop `p`'s subtree and ancestors / everything | `invalidate_cache(path)` / `invalidate_cache()` |
+| `ttl`, `max_dirs` | per-entry expiry; LRU over directory nodes | `listings_expiry_time`, `max_paths` |
+| data | never cached (`cat_file`, `get_file`, read handles pass straight through) | — |
+
+Invalidation happens whether or not the wrapped call succeeded (conservative:
+a failed delete may still have changed something). The cache is exact for this
+client's own writes; another writer is reconciled by `ttl`,
+`invalidate_cache`, or `refresh` — the contract gcsfs documents.
 
 ### 4.3 Option structs
 
@@ -310,7 +339,7 @@ struct-update syntax; adding a field is a minor-version bump.
 |---|---|
 | `OpenOptions` | `mode: OpenMode` (`Read`/`Write`/`Append`/`CreateNew`, parsed from `"rb" "wb" "ab" "xb"`), `block_size`, `content_type`, `metadata` |
 | `WriteOptions` | `mode: WriteMode` (`Overwrite`/`Create`), `content_type`, `metadata`, `block_size` |
-| `ListOptions` | `versions` |
+| `ListOptions` | `versions`, `refresh` (bypass and replace a cached listing; ignored by backends) |
 | `FindOptions` | `maxdepth`, `withdirs`, `versions` |
 | `WalkOptions` / `GlobOptions` | `maxdepth` |
 | `DuOptions` | `maxdepth`, `withdirs` |
@@ -579,7 +608,7 @@ implements and tests; say so if you want any of them changed.
 
 | # | Question | Recommendation / status |
 |---|---|---|
-| **D1** | Directory cache: none in Rust, fsspec `dircache` in Python? | Yes — no cache in Rust; keeps Rust stateless and semantics identical to gcsfs. |
+| **D1** | Directory cache: none in Rust, fsspec `dircache` in Python? | Originally yes. *Revised by D30*: backends still cache nothing, but an opt-in `CachedFs` decorator now provides the `dircache` semantics in Rust so `info` and `ls` share one store. |
 | **D2** | Root handling: `ls_buckets()` method vs `Location { Root, Path }` on every call? | *Resolved by the string-path traits*: the root is `""`; `ls("")` lists buckets, no special method. |
 | **D3** | `open` (read) + `create` (write) vs one `open(path, mode)`? | *Resolved*: one `open(path, OpenOptions { mode })` returning `Box<dyn File>`, exactly like fsspec. |
 | **D4** | Read-ahead buffer in Rust `GcsFile::read` (default 5 MiB) or keep fsspec's `AbstractBufferedFile` cache in Python? | In Rust, configurable via `OpenOptions::block_size`; lets the Python file object be a thin shim. Not part of the contract. |
@@ -608,3 +637,4 @@ implements and tests; say so if you want any of them changed.
 | **D27** | Keep an explicit `File::discard()`, or let dropping the handle be the only way to abandon a write? | *Decided*: **keep `discard()`**, with `Drop` as the safety net. Considered and rejected: drop-only. It works for GCS (abort is sync and infallible, and `Drop` is deterministic), but an explicit method (a) is the 1:1 target for fsspec's `AbstractBufferedFile.discard()` and the `commit`/`discard` transaction protocol, (b) is async and fallible, so a backend whose cancellation is a remote call (gcsfs deletes the JSON-API resumable session) can run and report it, (c) marks the handle `closed` so later I/O fails with `Closed` instead of feeding a dead upload, and (d) keeps "abandon, don't publish" an enforceable, testable part of the contract rather than a documented `Drop` convention. Implementations must still publish only from `close`, so an unclosed, undiscarded handle abandons on drop. The bridge maps Python `discard()` straight through. |
 | **D28** | How do single-file reads grow new per-call options (parallel range requests, checksum verification, ...) without breaking every `impl FileSystem` and caller? | *Decided*: `cat_file` and `get_file` take a trailing `opts: ReadOptions`, mirroring `pipe_file`/`put_file` with `WriteOptions`; `OpenOptions::from_read` forwards it to `open` like `from_write` does. The struct is **empty today** (no knob is honoured yet, so none is exposed) and `#[non_exhaustive]`, so external code builds it with `ReadOptions::default()` and a new field is a non-breaking addition. Inside the crate the two consumers (`OpenOptions::from_read`, `GcsFs::cat_file`) destructure it (`let ReadOptions {} = opts;`) so a new field fails to compile until it is forwarded or handled. Rejected: a bare `concurrency` parameter (breaks on every later knob) and a silently ignored field. The other option structs are not `#[non_exhaustive]`; whether to apply it across the board is a pre-1.0 decision. |
 | **D29** | How `GcsFs` reaches kind-specific behaviour: branch on the kind inline, a per-kind inheritance-like chain, or per-axis driver objects? | *Decided*: **one `GcsFs`, branching on named capabilities of `BucketKind`** (`is_hierarchical`, `has_versioning`, `supports_server_copy`, `supports_http`, `objects_appendable`) — never on the variant itself, so each site states the property it needs and a new kind only answers five questions. Rejected: a `Zonal ⊃ HNS ⊃ Flat` chain — the kind is a property of the bucket, not of the filesystem object (one `GcsFs` serves every bucket and `copy_file` reads two kinds), and each level *removes* capabilities (HNS: versioning; zonal: server copy, HTTP, move fallback), which inheritance cannot express; gcsfs, with inheritance available, also dispatches per bucket inside one class. Deferred, not rejected: per-axis drivers (`NamespaceDriver` {prefix, folder} × `DataDriver` {standard, appendable} as zero-sized statics). They buy per-kind locality at the cost of two traits, four impls, `Backend` threaded through every call and return conventions for mid-method forks, while two-kind operations and `derived::*` fallbacks stay in the core anyway; the capability predicates are the common prefix of both designs, so the move stays mechanical if a fourth kind or more contributors make locality worth it. |
+| **D30** | Unified `info` + `ls` caching: where does it live and what are its semantics? | *Decided*: a **decorator**, `CachedFs<F: FileSystem>` (§4.2.1), not state inside `GcsFs` — the backend stays stateless and testable, the cache is testable on `MemoryFs`, and the bridge composes it like fsspec composes `dircache`. One directory-node store serves both primitives (a listing warms `info`; an `info` result never fakes a listing). Invalidation copies gcsfs's `DirCacheUpdater` rules exactly; two additions to the contract: `FileSystem::invalidate_cache` (default no-op) and `ListOptions::refresh`. Defaults mirror fsspec (`ttl: None`, `max_dirs: None`, `populate_from_find: true`) except **`negative: false`** — a cached "does not exist" is the one answer that goes wrong when another process creates a file, so it is opt-in. Not done (yet): serving `find` from the cache, HNS-targeted upserts after rename (gcsfs `HnsDirCacheUpdater`). |

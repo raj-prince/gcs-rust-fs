@@ -39,7 +39,7 @@ has no Python/PyO3 dependency: the storage logic lives here, is tested with
 ```
 
 Both traits are object-safe `async_trait` traits, so the bridge can pick an
-implementation at runtime; `tests/memory_fs.rs` is an in-memory implementation
+implementation at runtime; `tests/common/mod.rs` is an in-memory implementation
 that exercises every derived operation without network. The full semantics
 (directory emulation, fsspec copy rules, error classes, open decisions) are in
 [`docs/filesystem_api_design.md`](docs/filesystem_api_design.md).
@@ -57,6 +57,7 @@ Every `fsspec` operation that `gcsfs` needs, behind the `FileSystem` trait:
 | copy / move | `copy_file`, `copy`, `move_file`, `mv` | server-side `RewriteObject`; atomic `MoveObject` in one bucket; HNS directories renamed with `RenameFolder` |
 | delete | `rm_file`, `rm`, `rmdir` | one listing + concurrent `DeleteObject`; folders deepest-first; bucket deletion for `rm -r bucket` |
 | directories | `mkdir`, `rmdir`, `GcsFs::create_bucket` | buckets, `dir/` placeholders (flat), real folders (HNS) |
+| caching (opt-in) | `CachedFs::new(fs, CacheConfig)`, `invalidate_cache`, `ListOptions::refresh` | `fsspec` `dircache` semantics for `ls` **and** `info` from one store; see [Caching](#caching) |
 
 ### Bucket kinds
 
@@ -90,8 +91,9 @@ Other design points:
   as `bucket/key` without scheme or trailing slash.
 * **Snapshot semantics.** Read handles pin the generation observed at open
   time, so concurrent overwrites never produce torn reads.
-* **No global state, no cache.** `GcsFs` wraps the SDK's pooled clients and is
-  cheap to clone; every call reflects the bucket at the time of the request.
+* **No global state, no hidden cache.** `GcsFs` wraps the SDK's pooled clients
+  and is cheap to clone; every call reflects the bucket at the time of the
+  request. Caching is a separate, explicit layer ([Caching](#caching)).
 
 ## Usage
 
@@ -138,6 +140,61 @@ Writing to zonal buckets additionally requires building with the storage
 SDK's `google_cloud_unstable_storage_bidi` cfg — this repo sets it in
 [`.cargo/config.toml`](.cargo/config.toml); see the
 [dev guide](docs/dev_guide.md#zonal-writes-need-a-rustc-cfg).
+
+## Caching
+
+`CachedFs` wraps any `FileSystem` (it is one itself, so `Arc<dyn FileSystem>`
+works either way) and gives `ls` and `info` the `fsspec` directory-cache
+behaviour that `gcsfs` users rely on, with both served from **one** store: a
+listing warms `info` for every child, and individual `info` results are kept
+without ever being mistaken for a complete listing.
+
+```rust
+use bytes::Bytes;
+use gcs_rust_fs::{CacheConfig, CachedFs, FileSystem, GcsFs, ListOptions, WriteOptions};
+
+let fs = CachedFs::new(GcsFs::new().await?, CacheConfig::default());
+
+fs.ls("my-bucket/data", ListOptions::default()).await?; // one request
+fs.info("my-bucket/data/part-0.parquet").await?; // answered from the listing
+assert!(fs.is_dir("my-bucket/data").await?); // likewise
+
+let opts = WriteOptions::default();
+fs.pipe_file("my-bucket/data/new.bin", Bytes::from_static(b"x"), opts).await?;
+fs.ls("my-bucket/data", ListOptions::default()).await?; // refetched: own writes invalidate
+
+fs.invalidate_cache(Some("my-bucket/data")); // another writer changed things
+let refresh = ListOptions { refresh: true, ..Default::default() };
+fs.ls("my-bucket/data", refresh).await?; // or bypass once and re-store
+println!("{:?}", fs.stats()); // hits / misses / invalidations
+```
+
+What it does, and the `gcsfs` behaviour it mirrors:
+
+* Every mutating call — `pipe_file`, `put_file`, `copy_file`, `move_file`,
+  `mkdir`, `rmdir`, `rm_file`, the bulk `rm`/`copy`/`mv`/`put`, and write
+  handles at both `open` and `close` — invalidates exactly what gcsfs's
+  `DirCacheUpdater` invalidates: a write drops the cached parent (or the
+  parent and all ancestors when the parent was not cached, since an implicit
+  directory may have appeared); deletes and moves drop the affected subtree
+  plus ancestors.
+* A complete `find` (`withdirs`, no `maxdepth`) fills every directory it
+  visits, so a following `walk`/`du`/`glob` costs no requests
+  (`_find(update_cache=True)`).
+* `ListOptions::versions` and `path#generation` bypass the cache; data reads
+  are never cached.
+* `CacheConfig { ttl, max_dirs, negative, populate_from_find }` map to
+  fsspec's `listings_expiry_time`, `max_paths` and the implicit
+  `_ls_from_cache` behaviours. `negative` (answer *not found* from a cached
+  listing without asking) is **off** by default because it is the one answer
+  that is wrong when another process creates a file; turn it on for
+  `exists`-heavy loops when this client is the only writer.
+* The cache is exact for this client's own writes. Other writers are
+  reconciled by `ttl`, `invalidate_cache(path)` / `invalidate_cache(None)`,
+  or `ListOptions::refresh` — the same contract `gcsfs` documents.
+
+`GcsFs` on its own caches nothing except each bucket's kind; `invalidate_cache`
+and `refresh` are no-ops there.
 
 ## Transports
 

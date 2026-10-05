@@ -172,6 +172,10 @@ pub struct ListOptions {
     /// List every version/generation of each file; entry paths then carry a
     /// `#<generation>` suffix (`gcsfs` convention).
     pub versions: bool,
+    /// Bypass any cached listing and fetch from the store (`fsspec`
+    /// `ls(refresh=True)`); the fresh result replaces the cached one. Ignored
+    /// by filesystems that cache nothing.
+    pub refresh: bool,
 }
 
 /// Options for [`FileSystem::find`](crate::FileSystem::find).

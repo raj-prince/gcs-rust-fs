@@ -21,9 +21,9 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 use gcs_rust_fs::{
-    BucketKind, ByteRange, CopyOptions, Entry, ErrorKind, FileSystem, FindOptions, GcsFs,
-    ListOptions, MkdirOptions, OpenMode, OpenOptions, ReadOptions, RmOptions, WalkOptions,
-    WriteMode, WriteOptions,
+    BucketKind, ByteRange, CacheConfig, CachedFs, CopyOptions, Entry, ErrorKind, FileSystem,
+    FindOptions, GcsFs, ListOptions, MkdirOptions, OpenMode, OpenOptions, ReadOptions, RmOptions,
+    WalkOptions, WriteMode, WriteOptions,
 };
 
 const OBJECT_VAR: &str = "GCS_RUST_FS_TEST_OBJECT";
@@ -807,6 +807,73 @@ async fn append_mode(fs: GcsFs, kind: BucketKind, root: String) {
     assert_eq!(fs.size(&fresh).await.unwrap(), 3);
 }
 
+/// `CachedFs` over the real backend: the memory-store suite proves the cache
+/// logic; this proves it against real entry shapes and path spellings.
+async fn cached_listing_and_info(fs: GcsFs, root: String) {
+    let fs = CachedFs::new(fs, CacheConfig::default());
+    let misses = |fs: &CachedFs<GcsFs>| fs.stats().misses;
+    let hits = |fs: &CachedFs<GcsFs>| fs.stats().hits;
+    let dir = format!("{root}/cache");
+    let sub = format!("{dir}/sub");
+    let a = format!("{dir}/a.txt");
+    let b = format!("{sub}/b.txt");
+    for file in [&a, &b] {
+        fs.pipe_file(file, Bytes::from_static(b"x"), WriteOptions::default())
+            .await
+            .unwrap();
+    }
+
+    // One listing warms `info` for every child, under either spelling.
+    let listing = fs.ls(&dir, ListOptions::default()).await.unwrap();
+    assert_eq!(paths(&listing), [a.as_str(), sub.as_str()]);
+    assert_eq!((hits(&fs), misses(&fs)), (0, 1));
+    assert_eq!(fs.ls(&dir, ListOptions::default()).await.unwrap(), listing);
+    assert!(fs.info(&a).await.unwrap().is_file());
+    assert!(fs.info(&format!("gs://{a}")).await.unwrap().is_file());
+    assert!(fs.info(&sub).await.unwrap().is_dir());
+    assert!(fs.is_dir(&dir).await.unwrap(), "listed directory exists");
+    assert_eq!((hits(&fs), misses(&fs)), (5, 1));
+
+    // A complete `find` fills every directory; `walk` then costs nothing.
+    fs.find(
+        &root,
+        FindOptions {
+            withdirs: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let before = misses(&fs);
+    let walked = fs.walk(&root, WalkOptions::default()).await.unwrap();
+    assert_eq!(walked.len(), 3, "{root}, cache, cache/sub");
+    assert_eq!(misses(&fs), before, "walk served from the cache");
+
+    // Own writes and deletes are reflected immediately.
+    fs.rm_file(&a).await.unwrap();
+    let after_rm = fs.ls(&dir, ListOptions::default()).await.unwrap();
+    assert_eq!(paths(&after_rm), [sub.as_str()]);
+    assert_eq!(misses(&fs), before + 1);
+    let c = format!("{dir}/c.txt");
+    let mut w = fs.open(&c, OpenOptions::write()).await.unwrap();
+    w.write(Bytes::from_static(b"c")).await.unwrap();
+    w.close().await.unwrap();
+    assert!(paths(&fs.ls(&dir, ListOptions::default()).await.unwrap()).contains(&c.as_str()));
+    assert_eq!(misses(&fs), before + 2);
+
+    // Another writer is invisible until the cache is told.
+    let external = format!("{dir}/external.txt");
+    fs.inner()
+        .pipe_file(&external, Bytes::from_static(b"e"), WriteOptions::default())
+        .await
+        .unwrap();
+    let stale = fs.ls(&dir, ListOptions::default()).await.unwrap();
+    assert!(!paths(&stale).contains(&external.as_str()));
+    fs.invalidate_cache(Some(&dir));
+    let fresh = fs.ls(&dir, ListOptions::default()).await.unwrap();
+    assert!(paths(&fresh).contains(&external.as_str()));
+}
+
 macro_rules! per_kind {
     ($name:ident, |$fs:ident, $kind:ident, $root:ident| $body:expr) => {
         #[tokio::test]
@@ -851,3 +918,7 @@ per_kind!(rw_copy_move_and_remove, |fs, kind, root| {
     copy_move_and_remove(fs, kind, root)
 });
 per_kind!(rw_append_mode, |fs, kind, root| append_mode(fs, kind, root));
+per_kind!(rw_cached_listing_and_info, |fs, kind, root| {
+    let _ = kind;
+    cached_listing_and_info(fs, root)
+});

@@ -19,7 +19,8 @@ use crate::stat::ObjectStat;
 /// (fsspec's default block size).
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 5 * 1024 * 1024;
 
-/// An opened object, returned by [`GcsFs::open`](crate::GcsFs::open).
+/// An opened object, returned by [`GcsFs`](crate::GcsFs)'s
+/// [`FileSystem::open`](crate::FileSystem::open).
 ///
 /// **Read handles** pin the generation observed at open time, so every read
 /// sees the same immutable bytes even if the object is overwritten

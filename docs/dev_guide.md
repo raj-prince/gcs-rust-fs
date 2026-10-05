@@ -85,7 +85,8 @@ runs four suites; only one needs a network:
 | Suite | What it covers | Network |
 |-------|----------------|---------|
 | unit tests (`src/**`, `#[cfg(test)]`) | path/range parsing, error mapping, glob rules, bucket-kind detection, entry conversion | no |
-| `tests/memory_fs.rs` | an in-memory `FileSystem` implementing only the six required primitives; exercises every derived operation (`find`, `walk`, `glob`, `cat`, `rm`, `copy`, `mv`, `put`, …) | no |
+| `tests/memory_fs.rs` | every derived operation (`find`, `walk`, `glob`, `cat`, `rm`, `copy`, `mv`, `put`, …) over `tests/common/mod.rs`, an in-memory `FileSystem` implementing only the six required primitives | no |
+| `tests/cache.rs` | `CachedFs` over the same in-memory store: hit/miss accounting, the shared `ls`/`info` store, every invalidation rule, `refresh`, TTL, LRU | no |
 | `tests/live.rs` | `GcsFs` against real buckets. **Self-skips** — every test returns early and reports *passed* — unless the variables below are set | yes |
 | doctests | the `///` examples in `src/` | no |
 
@@ -151,6 +152,8 @@ src/
   range.rs, stat.rs, error.rs
   derived.rs, glob.rs           fsspec semantics, written once on top of the
                                 six required primitives
+  cached.rs, dircache.rs        CachedFs decorator (fsspec dircache for ls+info)
+                                and its directory-node store
   gcs/                          the GCS implementation; the only code that
                                 knows about buckets, gRPC or the SDK
     fs.rs                       GcsFs + GcsFsBuilder: the FileSystem impl,
@@ -162,7 +165,9 @@ src/
     backend.rs                  SDK clients, Transport, raw ranged reads
     control.rs                  listing, buckets, HNS folders, delete, rewrite, move
     write.rs                    one-shot uploads, resumable + appendable writers
-tests/memory_fs.rs              reference in-memory FileSystem
+tests/common/mod.rs             reference in-memory FileSystem (shared harness)
+tests/memory_fs.rs              derived-operation tests on it
+tests/cache.rs                  CachedFs tests on it
 tests/live.rs                   real-bucket tests (env-gated, per bucket kind)
 examples/gcs.rs                 CLI binary
 docs/filesystem_api_design.md   behavioural spec and decisions
@@ -175,4 +180,4 @@ Implement the six required methods — `info`, `ls`, `open`, `rm_file`, `mkdir`,
 `rmdir` — under `#[gcs_rust_fs::async_trait]`, plus a `File` for what `open`
 returns. Everything else comes from `derived.rs` and may be overridden when
 the backend has a native fast path (e.g. flat listing for `find`).
-`tests/memory_fs.rs` is the smallest complete example.
+`tests/common/mod.rs` is the smallest complete example.

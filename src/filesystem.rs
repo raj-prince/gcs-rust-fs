@@ -61,8 +61,12 @@ use crate::range::ByteRange;
 ///   variants exist for `rm`, `copy` and `mv`.
 /// * Bulk operations run with bounded concurrency and honour
 ///   [`OnError`](crate::OnError) where `fsspec` exposes `on_error`.
-/// * Nothing is cached: every call reflects the store at the time of the
-///   request. Directory caching, if wanted, belongs to the caller.
+/// * Backends cache nothing: every call reflects the store at the time of
+///   the request. Wrapping a filesystem in [`CachedFs`](crate::CachedFs)
+///   opts into `fsspec`'s directory-cache semantics for `ls`/`info`;
+///   [`invalidate_cache`](Self::invalidate_cache) and
+///   [`ListOptions::refresh`] then behave as they do in `fsspec`, and are
+///   no-ops everywhere else.
 ///
 /// The trait is object-safe: `Arc<dyn FileSystem>` and `Box<dyn File>` are
 /// the intended currency for language bridges.
@@ -173,6 +177,15 @@ pub trait FileSystem: Send + Sync {
     /// store has one.
     async fn move_file(&self, src: &str, dst: &str) -> Result<()> {
         derived::move_file(self, src, dst).await
+    }
+
+    /// Discard cached listings and metadata for `path` and its ancestors, or
+    /// everything when `path` is `None` (`fsspec` `invalidate_cache`).
+    ///
+    /// Backends cache nothing and ignore this; [`CachedFs`](crate::CachedFs)
+    /// implements it. Call it when another writer may have changed the store.
+    fn invalidate_cache(&self, path: Option<&str>) {
+        let _ = path;
     }
 
     // =====================================================================

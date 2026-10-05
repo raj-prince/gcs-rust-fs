@@ -6,7 +6,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use google_cloud_storage::model::Object;
 
-/// Metadata about a GCS object, as returned by [`GcsFs::stat`](crate::GcsFs::stat).
+/// Metadata about a GCS object, carried by [`Entry::stat`](crate::Entry::stat) and
+/// [`File::stat`](crate::File::stat).
 ///
 /// Field names follow the JSON API / `gcsfs` conventions where they differ from
 /// the gRPC proto (`time_created` rather than `create_time`, base64 `md5_hash`,

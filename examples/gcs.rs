@@ -105,6 +105,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "ls" => {
             let opts = ListOptions {
                 versions: args.flag("--versions"),
+                ..Default::default()
             };
             for e in fs.ls(args.arg(0, "path")?, opts).await? {
                 print_entry(&e);

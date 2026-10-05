@@ -67,6 +67,7 @@ pub(crate) async fn find<F: FileSystem + ?Sized>(
     };
     let list_opts = ListOptions {
         versions: opts.versions,
+        refresh: false,
     };
     let mut out = Vec::new();
     if opts.withdirs && !root.path.is_empty() {
