@@ -19,7 +19,7 @@
 //! |-------|-------|-------------|
 //! | contract | [`FileSystem`], [`File`], [`Entry`], option structs | paths, bytes, directories, errors |
 //! | derived operations | default methods of [`FileSystem`] (`find`, `glob`, `walk`, `rm`, `copy`, ...) | only the six required primitives |
-//! | implementation | [`GcsFs`], [`GcsFile`], [`Transport`] | buckets, generations, gRPC / JSON API |
+//! | implementation | [`GcsFs`], [`GcsFile`], [`BucketKind`], [`Transport`] | buckets, generations, folders, gRPC / JSON API |
 //!
 //! [`FileSystem`] is the Rust counterpart of `fsspec`'s `AbstractFileSystem`
 //! and [`File`] of its `AbstractBufferedFile`. Both are object-safe async
@@ -27,27 +27,31 @@
 //! `Box<dyn File>` and pick the implementation at runtime. Implementors use
 //! the re-exported [`macro@async_trait`] attribute.
 //!
-//! > **Status:** the traits and their derived operations are complete;
-//! > [`GcsFs`] / [`GcsFile`] currently expose the read-only subset through
-//! > inherent methods and do not implement the traits yet.
+//! ## Bucket kinds
 //!
-//! ## Operations available today
+//! Cloud Storage has three kinds of bucket and [`GcsFs`] handles all of them
+//! behind the same contract, detecting the kind of each bucket on first use:
 //!
-//! | Operation | Entry point | Wire protocol |
-//! |-----------|-------------|---------------|
-//! | metadata  | [`GcsFs::stat`] | gRPC `GetObject` |
-//! | ranged read into memory | [`GcsFs::cat_file`] | gRPC `BidiReadObject` (default) or JSON API over HTTP — see [`Transport`] |
-//! | repeated ranged reads | [`GcsFs::open`] → [`GcsFile`] | same as above, pinned to one generation |
+//! | [`BucketKind`] | Directories | Notes |
+//! |----------------|-------------|-------|
+//! | `Flat` | emulated from object-name prefixes and `dir/` placeholders | gRPC or HTTP reads |
+//! | `Hierarchical` | real folders (empty ones exist); `mv` of a directory is an atomic rename | gRPC or HTTP reads |
+//! | `Zonal` (Rapid Storage) | as hierarchical | gRPC only; appendable objects (`flush` persists, [`OpenMode::Append`] works); no server-side copy |
 //!
 //! ```no_run
-//! use gcs_rust_fs::{ByteRange, GcsFs, GcsPath, Transport};
+//! use gcs_rust_fs::{ByteRange, FileSystem, FindOptions, GcsFs, OpenOptions, Transport};
 //!
 //! # async fn demo() -> gcs_rust_fs::Result<()> {
 //! let fs = GcsFs::builder().transport(Transport::Grpc).build().await?;
-//! let path: GcsPath = "gs://my-bucket/checkpoint.pt".parse()?;
-//! let stat = fs.stat(&path).await?;
-//! let first_mib = fs.cat_file(&path, ByteRange::head(1 << 20)).await?;
-//! # let _ = (stat, first_mib);
+//!
+//! let info = fs.info("gs://my-bucket/checkpoint.pt").await?;
+//! let first_mib = fs.cat_file("my-bucket/checkpoint.pt", ByteRange::head(1 << 20)).await?;
+//! let everything = fs.find("my-bucket/data", FindOptions::default()).await?;
+//!
+//! let mut out = fs.open("my-bucket/out.bin", OpenOptions::write()).await?;
+//! out.write(first_mib).await?;
+//! out.close().await?;
+//! # let _ = (info, everything);
 //! # Ok(()) }
 //! ```
 //!
@@ -58,7 +62,8 @@
 //! `FileNotFoundError`, `PermissionDenied` → `PermissionError`,
 //! `IsADirectory` / `NotADirectory` / `AlreadyExists` / `DirectoryNotEmpty` →
 //! the matching `OSError` subclass, `InvalidPath`/`InvalidRange` →
-//! `ValueError`, everything else → `OSError`.
+//! `ValueError`, `Unsupported` → `NotImplementedError`, everything else →
+//! `OSError`.
 //!
 //! ## Authentication
 //!
@@ -76,7 +81,6 @@ mod filesystem;
 mod gcs;
 mod glob;
 mod options;
-mod path;
 mod range;
 mod stat;
 
@@ -84,13 +88,12 @@ pub use entry::{DiskUsage, Entry, EntryKind, WalkEntry};
 pub use error::{classify_storage_error, Error, ErrorKind, Result, StorageError};
 pub use file::File;
 pub use filesystem::FileSystem;
-pub use gcs::{GcsFile, GcsFs, GcsFsBuilder, Transport};
+pub use gcs::{BucketKind, BucketSpec, GcsFile, GcsFs, GcsFsBuilder, Transport, PROJECT_ENV_VARS};
 pub use options::{
     BulkOptions, CopyOptions, DuOptions, FindOptions, GlobOptions, ListOptions, MkdirOptions,
     OnError, OpenMode, OpenOptions, PutOptions, RmOptions, WalkOptions, WriteMode, WriteOptions,
     DEFAULT_CONCURRENCY,
 };
-pub use path::GcsPath;
 pub use range::ByteRange;
 pub use stat::ObjectStat;
 

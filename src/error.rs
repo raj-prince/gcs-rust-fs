@@ -10,8 +10,6 @@ use std::fmt;
 
 use google_cloud_gax::error::rpc::Code;
 
-use crate::path::GcsPath;
-
 /// The error type produced by the underlying Google Cloud Rust SDK.
 pub type StorageError = google_cloud_storage::Error;
 
@@ -255,7 +253,7 @@ impl Error {
 
     /// Wrap an SDK error raised while performing `op` on `path`, classifying it
     /// into the most specific [`ErrorKind`] available.
-    pub(crate) fn storage(op: &str, path: &GcsPath, source: StorageError) -> Self {
+    pub(crate) fn storage(op: &str, path: impl fmt::Display, source: StorageError) -> Self {
         let kind = classify_storage_error(&source);
         Self::with_source(kind, format!("{op} {path} failed ({kind})"), source)
     }
@@ -442,8 +440,7 @@ mod tests {
 
     #[test]
     fn storage_error_keeps_context_and_source() {
-        let path = GcsPath::parse("gs://b/o").unwrap();
-        let err = Error::storage("stat", &path, http(404));
+        let err = Error::storage("stat", "gs://b/o", http(404));
         assert!(err.is_not_found());
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(err.storage_source().is_some());
@@ -454,8 +451,7 @@ mod tests {
 
     #[test]
     fn converts_to_io_error() {
-        let path = GcsPath::parse("gs://b/o").unwrap();
-        let io: std::io::Error = Error::storage("stat", &path, http(403)).into();
+        let io: std::io::Error = Error::storage("stat", "gs://b/o", http(403)).into();
         assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
         let io: std::io::Error = Error::invalid_path("x", "nope").into();
         assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);

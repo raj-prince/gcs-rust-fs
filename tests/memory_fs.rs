@@ -799,12 +799,23 @@ async fn file_handle_contract() {
         "abc"
     );
 
-    // Discard publishes nothing.
+    // Discard publishes nothing and is idempotent.
     let mut d = fs.open("b/d.txt", OpenOptions::write()).await.unwrap();
     d.write(Bytes::from_static(b"zzz")).await.unwrap();
     d.discard().await.unwrap();
     assert!(d.closed());
+    d.discard().await.unwrap();
+    assert_eq!(
+        d.write(Bytes::from_static(b"x")).await.unwrap_err().kind(),
+        ErrorKind::Closed
+    );
     assert!(!fs.exists("b/d.txt").await.unwrap());
+
+    // Dropping an unclosed write handle publishes nothing either.
+    let mut d = fs.open("b/d2.txt", OpenOptions::write()).await.unwrap();
+    d.write(Bytes::from_static(b"zzz")).await.unwrap();
+    drop(d);
+    assert!(!fs.exists("b/d2.txt").await.unwrap());
 
     // Mode errors.
     async fn open_err(fs: &MemoryFs, path: &str, opts: OpenOptions) -> ErrorKind {

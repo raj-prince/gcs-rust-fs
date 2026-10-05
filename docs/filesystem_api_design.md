@@ -146,7 +146,51 @@ regardless of depth. Then in Rust:
 `walk`, `du`, `rm -r`, `copy -r`, `mv -r` are all built on `find`, which means
 **one listing pass per operation** instead of fsspec's one `ls` per directory.
 
+### 2.4 Bucket kinds: flat, hierarchical (HNS) and zonal (Rapid)
+
+GCS has three kinds of bucket and they differ in exactly the places where the
+emulation above matters. gcsfs upstream encodes the same split in
+`ExtendedGcsFileSystem`; this is the spec we mirror.
+
+| Kind | Detected by | Directories | Data path |
+|---|---|---|---|
+| **Flat** (default) | neither of the below | emulated from prefixes / placeholders (§2.1–2.3) | gRPC bidi **or** HTTP |
+| **Hierarchical** (HNS) | `GetStorageLayout.hierarchical_namespace.enabled` | real `Folder` resources (Storage Control API); empty folders exist; no object versioning | gRPC bidi **or** HTTP |
+| **Zonal** (Rapid Storage) | `GetStorageLayout.location_type == "zone"` (always HNS) | as HNS | **gRPC only**; objects are appendable (single writer, readable while unfinalized); no `RewriteObject` / `Compose` |
+
+Detection is lazy — one `GetStorageLayout` per bucket on first use (it only
+needs `storage.objects.list`, which is why gcsfs uses it rather than
+`GetBucket`) — and cached for the lifetime of the `GcsFs`. A failed lookup
+(missing bucket, missing permission, transient error) is logged at `warn` and
+the bucket is treated as **flat without caching**, so a later call retries.
+`GcsFsBuilder::bucket_kind(bucket, kind)` pre-seeds the cache for tests or
+for principals that cannot read the layout. `GcsFs::bucket_kind(bucket)`
+exposes the resolved kind to the bridge (gcsfs's `_is_zonal_bucket`).
+
+What each operation does per kind (object reads/writes/deletes are identical
+unless stated):
+
+| Operation | Flat | HNS | Zonal |
+|---|---|---|---|
+| `info(dir)` | 1-item prefix listing / placeholder | `GetFolder` (times + metageneration in `Entry::stat`) | as HNS |
+| `ls` | `ListObjects` delimiter `/` | + `include_folders_as_prefixes` so empty folders appear | as HNS |
+| `find` | one flat `ListObjects` | `ListObjects` ∥ `ListFolders(prefix)`, merged (empty folders) | as HNS |
+| `mkdir` nested | no-op / placeholder (D8) | `CreateFolder(recursive = create_parents)`; missing parent → `NotFound`; exists → ok | as HNS |
+| `rmdir` nested | placeholder deleted if otherwise empty, else `DirectoryNotEmpty` (D12) | drop placeholder, then `DeleteFolder`; non-empty → `DirectoryNotEmpty` | as HNS |
+| `mv` of a directory | derived: per-object `move_file` + cleanup | `RenameFolder` (atomic LRO) when same bucket; else derived | as HNS |
+| `move_file` | same bucket `MoveObject`; else copy + delete | same | `MoveObject`; cross-bucket → `Unsupported` |
+| `copy_file` | `RewriteObject` (token loop) | same | `Unsupported` (no server-side copy); the bridge may fall back to download + upload |
+| read | configured `Transport` | same | always gRPC, whatever `Transport` says |
+| write (`w`/`x`) | `WriteObject` resumable stream; `close` publishes | same | `open_appendable_object`; `flush` persists (visible to readers); `close` finalizes only if `finalize_on_close` |
+| `OpenMode::Append` | `Unsupported` | `Unsupported` | `reopen_appendable_object(generation)` |
+| `ls`/`find` `versions` | honoured | ignored (no versioning on HNS) | ignored |
+
+The storage-neutral contract is untouched by all of this; the kind is an
+implementation detail of `src/gcs/`. The two public additions are
+`BucketKind` (behind `GcsFs`) and the builder knobs listed in §8.
+
 ---
+
 
 ## 3. Path model
 
@@ -297,7 +341,7 @@ pub trait File: Send + Sync {
     async fn flush(&mut self) -> Result<()>;                          // hands bytes to the upload; does NOT publish
 
     async fn close(&mut self) -> Result<()>;                          // writers: finalise + publish atomically; idempotent
-    async fn discard(&mut self) -> Result<()>;                        // writers: abort; idempotent
+    async fn discard(&mut self) -> Result<()>;                        // writers: abort, publish nothing; idempotent (D27)
 }
 ```
 
@@ -308,10 +352,12 @@ pub trait File: Send + Sync {
 - Read handles pin the content at open time (generation on GCS).
 - Writers follow object-store semantics that differ from local files and must
   be documented for users: objects are immutable, so **nothing is visible until
-  `close()`**; `flush()` only pushes bytes into the upload; dropping or
-  `discard()`ing a writer publishes nothing; `Append` is `Unsupported` on GCS
-  for now (appendable objects are preview-only in the SDK); `CreateNew`
-  maps to `if_generation_match = 0` → `AlreadyExists`.
+  `close()`**; `flush()` only pushes bytes into the upload; `discard()`
+  abandons the upload and publishes nothing, and dropping an unclosed writer
+  does the same as a safety net (D27); `Append` is `Unsupported` except on
+  zonal buckets, where appendable objects make `flush()` persist and
+  `discard()` cannot un-publish (D21, D26); `CreateNew` maps to
+  `if_generation_match = 0` → `AlreadyExists` (D25).
 - Planned GCS writer: a channel-backed `StreamingSource` feeding
   `Storage::write_object(..).send_buffered()` on a background task; the SDK
   handles resumable vs single-shot, retries and CRC32C.
@@ -465,8 +511,17 @@ remaining work (in-flight tasks are cancelled) and is returned. `rm` treats
 | `default_concurrency(n)` | `GCS_RUST_FS_CONCURRENCY` | bulk ops |
 | `read_block_size(bytes)` | `GCS_RUST_FS_READ_BLOCK_SIZE` | `GcsFile::read` read-ahead |
 | `write_block_size(bytes)` | `GCS_RUST_FS_WRITE_BLOCK_SIZE` | `GcsWriter` chunking |
+| `bucket_kind(bucket, kind)` | — | pre-seeds the bucket-kind cache (§2.4) |
+| `finalize_on_close(bool)` (default `false`, as gcsfs) | — | zonal writers: whether `close` finalizes the appendable object |
 
 Existing: `transport`, `endpoint`, `grpc_subchannel_count`, `from_env()`.
+
+Bucket creation with GCS-specific placement is **not** part of the contract
+(`MkdirOptions` stays `create_parents` / `location` / `placeholder`). The
+inherent `GcsFs::create_bucket(name, BucketSpec { location, zone,
+hierarchical, storage_class })` covers gcsfs's
+`mkdir(enable_hierarchical_namespace=…, placement=…)`; the bridge calls it
+when those kwargs are present and `mkdir` otherwise.
 
 ---
 
@@ -503,9 +558,8 @@ fsspec-derived helpers (`glob`, `expand_path`, `cat` with globs, `get`, `pipe`,
 | Phase | Scope | Verification |
 |---|---|---|
 | **0 — contract** ✅ | `FileSystem` / `File` traits, `Entry`, option structs, new error kinds, generic `derived.rs` (`find walk du glob cat cat_ranges rm copy mv put get_file …`) | `tests/memory_fs.rs`: an in-memory implementation of the six primitives drives every derived operation (12 scenario tests); `cargo clippy -D warnings`, docs |
-| **1 — GCS read & metadata** | `impl FileSystem for GcsFs`: `info/ls/open(read)` + native `find`/`cat_file`; `impl File for GcsFile` (cursor, `seek`, `read`); `GcsPath` bucket-only paths; root listing needs `project` | live tests on `gs://princer-bucket` (read-only), both transports |
-| **2 — GCS mutation** | GCS writer (`open(write)`, `close` publishes), `rm_file/mkdir/rmdir`, native `copy_file` (rewrite) / `move_file` (`MoveObject`) / `pipe_file` / `put_file` | live tests gated by `GCS_RUST_FS_TEST_BUCKET` using a unique scratch prefix with cleanup |
-| **3 — optimisation** | parallel listing shards, server-side `match_glob` for `glob`, HNS `rename_folder` for whole-directory `mv`, multi-range parallel `cat_file` for large objects | benchmarks vs gcsfs |
+| **1 — GCS implementation** ✅ (one PR, all three bucket kinds, read + write) | `impl FileSystem for GcsFs` (`info/ls/open/rm_file/mkdir/rmdir` + native `find/cat_file/pipe_file/put_file/copy_file/move_file`, `rm -r` in one listing, HNS `mv` via `RenameFolder`), `impl File for GcsFile` (cursor, `seek`, `read`, resumable writer, zonal appendable writer), bucket-kind detection (§2.4), `GcsFs::create_bucket`, `project` config | `tests/live.rs`: read-only tests via `GCS_RUST_FS_TEST_OBJECT`; five read/write scenarios (write/read back, streaming open, directories/listing/walk, copy/move/remove, append mode) run once per kind via `GCS_RUST_FS_TEST_BUCKETS=flat=princer-ckpt,hns=princer-test-bucket,zonal=princer-zonal-us-west4-a`, each under its own scratch tree that is removed and verified empty afterwards — all green on all three kinds |
+| **2 — optimisation** | parallel listing shards, server-side `match_glob` for `glob`, multi-range parallel `cat_file` for large objects, read-ahead tuning | benchmarks vs gcsfs |
 
 Testing approach: the fsspec semantics live in `derived.rs` and are
 storage-agnostic, so they are tested once, deterministically and without
@@ -541,3 +595,14 @@ implements and tests; say so if you want any of them changed.
 | **D14** | Keep `GcsFs::transport()` accessor? (carried over) | Keep; it is configuration, not a GCS feature. |
 | **D15** | Placeholder quirks in listings: mirror gcsfs exactly (`ls("b/dir")` includes a `b/dir` directory entry for its own placeholder; `find` emits `b/dir/` as a file plus a synthesised `b/dir` dir) or clean semantics (placeholders never listed as files, listed directory never lists itself)? | Clean semantics in the contract; a `GcsFsBuilder::gcsfs_compat(true)` switch (not a trait option) reproduces the quirks for the bridge so gcsfs's `test_dir_marker_*` tests keep passing. |
 | **D16** | Should `File` require `Debug` (so `Result<Box<dyn File>>` is `unwrap`-friendly and holders can `#[derive(Debug)]`)? | Not required for now; add `Debug` as a supertrait if the bridge wants it — it costs implementors one `impl`. |
+| **D17** | Delivery order of the GCS implementation. | *Decided*: one PR — all three bucket kinds, read and write (§10 phase 1). |
+| **D18** | Bucket-kind detection and failure behaviour. | *Decided*: lazy `GetStorageLayout` per bucket, cached for the `GcsFs` lifetime; a failed lookup is logged at `warn` and treated as flat **without caching**; `GcsFsBuilder::bucket_kind()` pre-seeds. |
+| **D19** | Where kind-specific logic lives. | *Decided*: one `GcsFs`; each trait method `match`es the kind; helpers split into `src/gcs/{control,write,…}.rs`. No per-kind public types. |
+| **D20** | Zonal buckets have no `RewriteObject`/`Compose`. | *Decided*: `copy_file` (and cross-bucket `move_file`) involving a zonal bucket → `ErrorKind::Unsupported` (gcsfs raises `NotImplementedError`); same-bucket `move_file` uses `MoveObject`. |
+| **D21** | Zonal write policy. | *Decided*: mirror gcsfs — `GcsFsBuilder::finalize_on_close(bool)` default `false` (object stays appendable; `close` = flush + close stream); `"ab"` reopens by generation; `flush` persists bytes (unlike other kinds). |
+| **D22** | Transport vs zonal (supersedes D13). | *Decided*: zonal data always travels over gRPC regardless of `Transport`; default stays `Grpc`; a non-zonal bucket whose bidi read fails with `Unimplemented`/`FailedPrecondition` falls back to HTTP for that read with a `warn`. |
+| **D23** | gcsfs `mkdir(enable_hierarchical_namespace=…, placement=…)`. | *Decided*: keep `MkdirOptions` storage-neutral; inherent `GcsFs::create_bucket(name, BucketSpec)` outside the trait (§8). |
+| **D24** | Live test buckets. | *Decided*: existing buckets — flat `princer-ckpt`, HNS `princer-test-bucket`, zonal `princer-zonal-us-west4-a` — via `GCS_RUST_FS_TEST_BUCKETS`, writing only under a per-run scratch prefix that is removed afterwards. |
+| **D25** | Create-only writes (`WriteMode::Create`, `OpenMode::CreateNew`, placeholder `mkdir`) on an existing object: the service answers the `if_generation_match = 0` precondition with `FAILED_PRECONDITION` / HTTP 412 on every bucket kind. | *Decided*: classified as `ErrorKind::AlreadyExists` (`O_EXCL` → `EEXIST`); the SDK error stays reachable through `Error::storage_source()`. A bare `PreconditionFailed` is reserved for preconditions the caller did not ask for. |
+| **D26** | `discard` on an appendable (zonal) write handle. | *Decided*: mirror gcsfs's `ZonalFile.discard` — the object was created at open and flushed bytes are persisted, so `discard` only stops writing and logs a `warn`; it does not delete the object. Documented as the stated exception in the `File` trait docs. Alternative (delete the object when this handle created it) is a one-line change in `Writer::discard` if the bridge prefers it. |
+| **D27** | Keep an explicit `File::discard()`, or let dropping the handle be the only way to abandon a write? | *Decided*: **keep `discard()`**, with `Drop` as the safety net. Considered and rejected: drop-only. It works for GCS (abort is sync and infallible, and `Drop` is deterministic), but an explicit method (a) is the 1:1 target for fsspec's `AbstractBufferedFile.discard()` and the `commit`/`discard` transaction protocol, (b) is async and fallible, so a backend whose cancellation is a remote call (gcsfs deletes the JSON-API resumable session) can run and report it, (c) marks the handle `closed` so later I/O fails with `Closed` instead of feeding a dead upload, and (d) keeps "abandon, don't publish" an enforceable, testable part of the contract rather than a documented `Drop` convention. Implementations must still publish only from `close`, so an unclosed, undiscarded handle abandons on drop. The bridge maps Python `discard()` straight through. |

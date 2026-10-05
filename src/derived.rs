@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::entry::{self, DiskUsage, Entry, WalkEntry};
 use crate::error::{Error, ErrorKind, Result};
+use crate::file::File;
 use crate::filesystem::FileSystem;
 use crate::glob;
 use crate::options::{
@@ -117,11 +118,20 @@ pub(crate) async fn pipe_file<F: FileSystem + ?Sized>(
     opts: WriteOptions,
 ) -> Result<()> {
     let mut file = fs.open(path, OpenOptions::from_write(opts)).await?;
-    if let Err(e) = file.write(data).await {
-        let _ = file.discard().await;
-        return Err(e);
+    let result = file.write(data).await;
+    finish_write(file.as_mut(), result).await
+}
+
+/// End a streaming write: publish on success, [`File::discard`] on failure.
+/// The original error is reported; a failure to discard is secondary.
+async fn finish_write(file: &mut dyn File, result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => file.close().await,
+        Err(e) => {
+            let _ = file.discard().await;
+            Err(e)
+        }
     }
-    file.close().await
 }
 
 pub(crate) async fn put_file<F: FileSystem + ?Sized>(
@@ -150,13 +160,7 @@ pub(crate) async fn put_file<F: FileSystem + ?Sized>(
         Ok(())
     }
     .await;
-    match result {
-        Ok(()) => file.close().await,
-        Err(e) => {
-            let _ = file.discard().await;
-            Err(e)
-        }
-    }
+    finish_write(file.as_mut(), result).await
 }
 
 pub(crate) async fn get_file<F: FileSystem + ?Sized>(
@@ -204,13 +208,7 @@ pub(crate) async fn copy_file<F: FileSystem + ?Sized>(fs: &F, src: &str, dst: &s
         Ok(())
     }
     .await;
-    match result {
-        Ok(()) => target.close().await,
-        Err(e) => {
-            let _ = target.discard().await;
-            Err(e)
-        }
-    }
+    finish_write(target.as_mut(), result).await
 }
 
 pub(crate) async fn move_file<F: FileSystem + ?Sized>(fs: &F, src: &str, dst: &str) -> Result<()> {
@@ -454,7 +452,7 @@ pub(crate) async fn rm<F: FileSystem + ?Sized>(fs: &F, path: &str, opts: RmOptio
 /// Returns the base path every relative source path is joined onto.
 /// `src_name` is the last component of the source, `src_trailing` whether the
 /// caller wrote the source with a trailing separator ("copy the contents").
-async fn destination_base<F: FileSystem + ?Sized>(
+pub(crate) async fn destination_base<F: FileSystem + ?Sized>(
     fs: &F,
     dst: &str,
     src_name: &str,

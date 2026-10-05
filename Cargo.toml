@@ -17,17 +17,26 @@ path = "src/lib.rs"
 
 [dependencies]
 google-cloud-storage = "1"
-# Only used for the canonical gRPC status codes when classifying SDK errors.
+# Canonical gRPC status codes (error classification) and the paginator traits.
 google-cloud-gax = "1"
+# `Poller` for the long-running `RenameFolder` operation on HNS buckets.
+google-cloud-lro = "1"
 # `FileSystem` / `File` are object-safe async traits (Arc<dyn FileSystem>,
 # Box<dyn File>) so the bridge can pick an implementation at runtime.
 async-trait = "0.1"
 # Bounded concurrency for the derived bulk operations (cat, rm, copy, put).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["macros", "fs", "io-util"] }
+# `rt` + `sync`: the resumable writer streams bytes through an mpsc channel into
+# a spawned upload task.
+tokio = { version = "1", features = ["macros", "fs", "io-util", "rt", "sync"] }
 bytes = "1"
 base64 = "0.22"
 tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+# The storage SDK's appendable-object API (zonal writes) is behind this rustc
+# cfg; see .cargo/config.toml.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(google_cloud_unstable_storage_bidi)"] }

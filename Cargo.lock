@@ -496,6 +496,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "google-cloud-gax",
+ "google-cloud-lro",
  "google-cloud-storage",
  "tokio",
  "tracing",

@@ -23,7 +23,7 @@ has no Python/PyO3 dependency: the storage logic lives here, is tested with
 │  derived ops     find walk du glob cat cat_ranges rm copy mv put …   │
 │                  (fsspec semantics, written once, storage-agnostic)  │
 │                        ▲                                             │
-│  implementation  src/gcs/: GcsFs, GcsFile, Transport {Grpc, Http}    │
+│  implementation  src/gcs/: GcsFs, GcsFile, BucketKind, Transport     │
 │                  (the only code that knows about buckets, gRPC, …)   │
 └──────────────────────────────┬───────────────────────────────────────┘
                                │ Cargo dependency
@@ -44,36 +44,54 @@ that exercises every derived operation without network. The full semantics
 (directory emulation, fsspec copy rules, error classes, open decisions) are in
 [`docs/filesystem_api_design.md`](docs/filesystem_api_design.md).
 
-> **Status:** the contract and derived operations are complete. `GcsFs` /
-> `GcsFile` currently implement the read-only subset below as inherent
-> methods; wiring them to the traits (and adding writes, listing, delete,
-> copy) is the next step.
-
 ## Features
 
-| Operation | API | Wire protocol |
-|-----------|-----|---------------|
-| Object metadata | `GcsFs::stat` | gRPC `GetObject` (`StorageControl`) |
-| Ranged read into memory | `GcsFs::cat_file` | gRPC `BidiReadObject` **or** JSON API over HTTP (see [Transports](#transports)) |
-| Repeated ranged reads on one generation | `GcsFs::open` → `GcsFile::read_range` | same as above, multiplexed over one bidi stream on gRPC |
+Every `fsspec` operation that `gcsfs` needs, behind the `FileSystem` trait:
 
-Design points:
+| Group | Methods | Implementation on GCS |
+|-------|---------|-----------------------|
+| metadata | `info`, `exists`, `is_file`, `is_dir`, `size` | `GetObject` **and** a directory probe issued concurrently (like gcsfs); `GetBucket` / `GetFolder` where applicable |
+| listing | `ls`, `find`, `walk`, `du`, `glob` | one `ListObjects` page stream per call (`find` is a single flat listing, not a walk); HNS folders via `ListFolders` |
+| reading | `cat_file`, `cat`, `cat_ranges`, `open(rb)` → `read`/`seek`/`read_range`, `get_file` | gRPC `BidiReadObject` or JSON API ([Transports](#transports)); read handles pin one generation |
+| writing | `pipe_file`, `put_file`, `put`, `open(wb/xb)` → `write`/`flush`/`close` | resumable `WriteObject` streamed from a spawned task; zonal buckets use appendable objects |
+| copy / move | `copy_file`, `copy`, `move_file`, `mv` | server-side `RewriteObject`; atomic `MoveObject` in one bucket; HNS directories renamed with `RenameFolder` |
+| delete | `rm_file`, `rm`, `rmdir` | one listing + concurrent `DeleteObject`; folders deepest-first; bucket deletion for `rm -r bucket` |
+| directories | `mkdir`, `rmdir`, `GcsFs::create_bucket` | buckets, `dir/` placeholders (flat), real folders (HNS) |
+
+### Bucket kinds
+
+Cloud Storage has three kinds of bucket; `GcsFs` detects each bucket's kind
+on first use (one `GetStorageLayout`, cached) and adapts:
+
+| `BucketKind` | Directories | Reads | Writes | Not available |
+|--------------|-------------|-------|--------|---------------|
+| `Flat` | emulated from prefixes and `dir/` placeholders; an empty directory only exists with a placeholder (`MkdirOptions::placeholder`) | gRPC or HTTP | resumable upload, published on `close` | append mode |
+| `Hierarchical` (HNS) | real folders — empty ones exist, `mkdir`/`rmdir` create and delete them, `mv` of a directory is one atomic rename | gRPC or HTTP | as flat | append mode, object versioning |
+| `Zonal` (Rapid Storage) | as HNS | gRPC only (the `Transport` setting is ignored) | appendable object: `flush` persists bytes readers can see; `close` finalizes only with `GcsFsBuilder::finalize_on_close(true)`; `open(ab)` reopens by generation | server-side copy (`copy_file` → `Unsupported`), cross-bucket `move_file` |
+
+`GcsFsBuilder::bucket_kind(bucket, kind)` pre-seeds the cache for principals
+that cannot read the layout. If detection fails the bucket is treated as flat
+for that call (and retried next time), which is what gcsfs does.
+
+Other design points:
 
 * **Python-slice byte ranges.** `ByteRange::new(start, end)` follows the exact
   `fsspec.cat_file(start, end)` contract: exclusive `end`, optional bounds,
-  negative bounds count from the end. Ranges the API supports natively
-  (absolute offsets, `head(n)`, `tail(n)`) never cost an extra request; only
-  mixed negative bounds trigger one `stat`. Empty ranges short-circuit.
+  negative bounds count from the end, past-the-end reads are empty. Ranges the
+  API supports natively (absolute offsets, `head(n)`, `tail(n)`) never cost an
+  extra request; only mixed negative bounds trigger one `GetObject`.
 * **Typed errors.** Every `Error` has an `ErrorKind` (`NotFound`,
-  `PermissionDenied`, `OutOfRange`, `InvalidPath`, ...) classified from the
-  gRPC status *or* HTTP status, so bridges never string-match messages.
-* **gcsfs path conventions.** `GcsPath::parse` accepts `gs://b/o`, `gcs://b/o`,
-  `b/o`, `/b/o`, and the `b/o#<generation>` suffix exactly like
-  `GCSFileSystem.split_path`.
-* **Snapshot semantics.** `GcsFile` pins the generation observed at open time,
-  so concurrent overwrites never produce torn reads.
-* **No global state.** `GcsFs` wraps the SDK's pooled clients and is cheap to
-  clone; build one instance and share it (the bridge keeps exactly one).
+  `IsADirectory`, `AlreadyExists`, `DirectoryNotEmpty`, `Unsupported`, ...)
+  classified from the gRPC status *or* HTTP status, so bridges never
+  string-match messages.
+* **gcsfs path conventions.** Paths are strings: `gs://b/k`, `gcs://b/k`,
+  `b/k`, `/b/k`, trailing slashes ignored, `b/k#<generation>` pins a
+  generation — exactly like `GCSFileSystem.split_path`. Entry paths come back
+  as `bucket/key` without scheme or trailing slash.
+* **Snapshot semantics.** Read handles pin the generation observed at open
+  time, so concurrent overwrites never produce torn reads.
+* **No global state, no cache.** `GcsFs` wraps the SDK's pooled clients and is
+  cheap to clone; every call reflects the bucket at the time of the request.
 
 ## Usage
 
@@ -84,78 +102,99 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ```rust
-use gcs_rust_fs::{ByteRange, GcsFs, GcsPath};
+use gcs_rust_fs::{ByteRange, FileSystem, FindOptions, GcsFs, OpenOptions, RmOptions, WriteOptions};
 
 #[tokio::main]
 async fn main() -> gcs_rust_fs::Result<()> {
     let fs = GcsFs::new().await?; // Application Default Credentials
-    let path: GcsPath = "gs://my-bucket/checkpoint.pt".parse()?;
 
-    let stat = fs.stat(&path).await?;
-    println!("{} bytes, generation {}, updated {:?}", stat.size, stat.generation, stat.updated);
+    let info = fs.info("gs://my-bucket/checkpoint.pt").await?;
+    println!("{} {} bytes", info.kind.as_str(), info.size);
 
-    let header = fs.cat_file(&path, ByteRange::head(1 << 20)).await?;   // first MiB
-    let footer = fs.cat_file(&path, ByteRange::tail(64)).await?;        // last 64 bytes
-    let window = fs.cat_file(&path, ByteRange::span(4096, 8192)).await?; // [4096, 8192)
+    let header = fs.cat_file("my-bucket/checkpoint.pt", ByteRange::head(1 << 20)).await?;
+    let footer = fs.cat_file("my-bucket/checkpoint.pt", ByteRange::tail(64)).await?;
 
-    // Repeated reads against one pinned generation:
-    let file = fs.open(&path).await?;
-    let chunk = file.read_range(ByteRange::head(4096)).await?;
-    assert!(chunk.len() <= 4096);
+    for entry in fs.find("my-bucket/data", FindOptions::default()).await? {
+        println!("{:>12} {}", entry.size, entry.path);
+    }
+
+    fs.pipe_file("my-bucket/out/small.bin", footer, WriteOptions::default()).await?;
+    let mut big = fs.open("my-bucket/out/big.bin", OpenOptions::write()).await?;
+    big.write(header).await?;
+    big.close().await?; // published atomically here
+
+    fs.rm("my-bucket/out", RmOptions { recursive: true, ..Default::default() }).await?;
     Ok(())
 }
 ```
 
+Writing to zonal buckets additionally requires building with the storage
+SDK's `google_cloud_unstable_storage_bidi` cfg — this repo sets it in
+[`.cargo/config.toml`](.cargo/config.toml); see the
+[dev guide](docs/dev_guide.md#zonal-writes-need-a-rustc-cfg).
+
 ## Transports
 
-Metadata always travels over gRPC. For object **data** choose with
-`GcsFsBuilder::transport(..)` or the `GCS_RUST_FS_TRANSPORT` environment
-variable:
+Metadata always travels over gRPC. For object **data** in flat and HNS
+buckets choose with `GcsFsBuilder::transport(..)` or the
+`GCS_RUST_FS_TRANSPORT` environment variable:
 
 | `Transport` | Mechanism | Notes |
 |-------------|-----------|-------|
-| `Grpc` (default) | `Storage::open_object` → `BidiReadObject` | Fastest path; one RPC per `cat_file` (open + read are fused). **Only enabled for some projects/buckets** — contact your account team. |
-| `Http` | `Storage::read_object` → JSON API with `Range` headers | Universally available fallback. |
+| `Grpc` (default) | `Storage::open_object` → `BidiReadObject` | Fastest path; one RPC per `cat_file` (open + read are fused). **Only enabled for some projects/buckets** — when the service reports it unavailable the read falls back to HTTP with a warning. |
+| `Http` | `Storage::read_object` → JSON API with `Range` headers | Universally available. |
 
-Both return byte-identical results and classify errors identically.
+Zonal buckets are gRPC-only and ignore the setting. Both transports return
+byte-identical results and classify errors identically.
 
 ## Error mapping for bridges
 
 | `ErrorKind` | Source | Suggested Python exception |
 |-------------|--------|----------------------------|
-| `NotFound` | 404 / `NOT_FOUND` | `FileNotFoundError` |
-| `PermissionDenied` | 403 / `PERMISSION_DENIED` | `PermissionError` |
-| `Unauthenticated` | 401 / `UNAUTHENTICATED` | `PermissionError` |
-| `OutOfRange` | 416 / `OUT_OF_RANGE` | `RuntimeError("... not satisfiable")` (what `GCSFile._fetch_range` expects) or return `b""` |
+| `NotFound` | 404 / `NOT_FOUND`, missing directory | `FileNotFoundError` |
+| `PermissionDenied`, `Unauthenticated` | 403 / 401 | `PermissionError` |
+| `IsADirectory`, `NotADirectory` | file operation on a directory and vice versa | `IsADirectoryError`, `NotADirectoryError` |
+| `AlreadyExists` | create-only write on an existing object, `mkdir` of an existing bucket/folder | `FileExistsError` |
+| `DirectoryNotEmpty` | `rmdir` | `OSError(ENOTEMPTY)` |
+| `Unsupported` | append on immutable objects, server-side copy on zonal buckets | `NotImplementedError` |
+| `OutOfRange` | 416 / `OUT_OF_RANGE` (only from `File::read_range`-free paths; `cat_file` returns `b""`) | `RuntimeError` or `b""` |
 | `InvalidPath`, `InvalidRange`, `InvalidConfig` | client-side validation | `ValueError` |
 | `Timeout` | 408 / 504 / `DEADLINE_EXCEEDED` | `TimeoutError` |
-| `ClientInit`, `Other` | everything else | `OSError` |
+| `Closed` | I/O on a closed handle | `ValueError("I/O operation on closed file")` |
+| `ClientInit`, `PreconditionFailed`, `Other` | everything else | `OSError` |
 
 `Error` also converts into `std::io::Error` with the analogous `io::ErrorKind`.
 
-## Examples
+## Example CLI
 
 ```bash
-cargo run --example stat -- gs://my-bucket/path/to/object
-cargo run --example cat  -- gs://my-bucket/path/to/object --start 0 --end 20
-cargo run --example cat  -- gs://my-bucket/path/to/object --start -100 --transport http
+cargo run --example gcs -- info  gs://my-bucket/path
+cargo run --example gcs -- ls    gs://my-bucket/dir
+cargo run --example gcs -- find  gs://my-bucket/dir --withdirs
+cargo run --example gcs -- cat   gs://my-bucket/file --start -100 --transport http
+cargo run --example gcs -- put   ./local.bin gs://my-bucket/file
+cargo run --example gcs -- mv    gs://my-bucket/dir gs://my-bucket/renamed -r
+cargo run --example gcs -- rm    gs://my-bucket/dir -r
+cargo run --example gcs -- kind  my-bucket
 ```
 
 ## Development
 
 ```bash
 cargo test                                                # unit + in-memory FS + doctests; live tests self-skip
-GCS_RUST_FS_TEST_OBJECT=gs://my-bucket/file.bin cargo test --test live   # against a real bucket (needs ADC)
+GCS_RUST_FS_TEST_OBJECT=gs://my-bucket/file.bin cargo test --test live          # read-only, real bucket
+GCS_RUST_FS_TEST_BUCKETS=flat=b1,hns=b2,zonal=b3 cargo test --test live          # read/write, per bucket kind
 ```
 
-Building the example binaries, the CI lint gate and the repo layout are in
+Building the example binary, the CI lint gate and the repo layout are in
 [`docs/dev_guide.md`](docs/dev_guide.md).
 
 ## Roadmap
 
-* `ls` / prefix listing with directory emulation (`GcsFs::list`)
-* Concurrent multi-range `cat_file` for very large reads
-* Writes (`put`, resumable / appendable uploads)
+* Parallel listing shards for very large prefixes (`lexicographic_start/end`)
+* Server-side `match_glob` for `glob`
+* Concurrent multi-range `cat_file` / `get_file` for very large objects
+* Streaming `find` / `walk` results
 
 ## License
 

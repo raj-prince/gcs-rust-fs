@@ -1,0 +1,9 @@
+# The storage SDK gates its appendable-object (BidiWriteObject) API — needed
+# to write to zonal / Rapid Storage buckets — behind a rustc cfg rather than a
+# Cargo feature, because the API is not yet stable. Enable it for every build
+# in this repository. Downstream crates must set the same flag (here, or via
+# RUSTFLAGS); without it zonal writes fail with ErrorKind::Unsupported.
+#
+# Note: a RUSTFLAGS environment variable overrides this setting entirely.
+[build]
+rustflags = ["--cfg", "google_cloud_unstable_storage_bidi"]

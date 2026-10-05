@@ -36,10 +36,16 @@ use crate::stat::ObjectStat;
 ///   whole file atomically. [`flush`](Self::flush) only hands buffered bytes
 ///   to the upload and provides back-pressure; it cannot publish partial
 ///   data.
-/// * Dropping an unclosed write handle discards the upload: the file is not
-///   created (or, when overwriting, the previous content stays untouched).
-///   Call [`discard`](Self::discard) to do so explicitly.
+/// * [`discard`](Self::discard) abandons the upload: the file is not created
+///   (or, when overwriting, the previous content stays untouched). Dropping
+///   an unclosed write handle has the same effect, as a safety net;
+///   implementations must publish only from `close`.
 /// * Writes are append-only; [`seek`](Self::seek) is unsupported.
+/// * **Appendable files** (zonal buckets, and any handle opened with
+///   [`OpenMode::Append`]) are the exception: the file exists as soon as the
+///   handle is opened, [`flush`](Self::flush) makes the bytes written so far
+///   readable by others, and [`discard`](Self::discard) cannot take them
+///   back — it only stops writing.
 ///
 /// # Lifecycle
 ///
@@ -125,8 +131,11 @@ pub trait File: Send + Sync {
     async fn close(&mut self) -> Result<()>;
 
     /// Abandon the handle. For write handles the pending upload is cancelled
-    /// and nothing is published. Idempotent; equivalent to `close` for read
-    /// handles.
+    /// and nothing is published (except for appendable files, see the trait
+    /// docs). Idempotent; equivalent to `close` for read handles.
+    ///
+    /// Async and fallible so that implementations whose cancellation is a
+    /// remote call can report it; the GCS implementation never fails here.
     async fn discard(&mut self) -> Result<()>;
 }
 
