@@ -121,7 +121,7 @@ impl Backend {
         kind: BucketKind,
     ) -> Result<Object> {
         debug!(%path, len = data.len(), %kind, "upload");
-        if kind == BucketKind::Zonal {
+        if kind.objects_appendable() {
             let mut writer = self.open_appendable(path, spec).await?;
             writer.write(data).await?;
             let finished = writer.close().await?;
@@ -170,7 +170,7 @@ impl Backend {
         kind: BucketKind,
     ) -> Result<Writer> {
         debug!(%path, %kind, create_only = spec.create_only, "start upload");
-        if kind == BucketKind::Zonal {
+        if kind.objects_appendable() {
             return self.open_appendable(path, spec).await;
         }
         let (tx, rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);

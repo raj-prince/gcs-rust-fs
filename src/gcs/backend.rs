@@ -229,12 +229,13 @@ impl Backend {
         }
     }
 
-    /// The transport actually used for `kind`: zonal buckets are gRPC-only.
+    /// The transport actually used for `kind`: the configured one where HTTP
+    /// is an option, gRPC otherwise.
     fn data_transport(&self, kind: BucketKind) -> Transport {
-        if kind == BucketKind::Zonal {
-            Transport::Grpc
-        } else {
+        if kind.supports_http() {
             self.transport
+        } else {
+            Transport::Grpc
         }
     }
 
@@ -242,7 +243,7 @@ impl Backend {
     /// buckets where HTTP is an option, and only when the service says the
     /// bidi API is not available rather than reporting a real failure.
     fn should_fall_back(kind: BucketKind, err: &Error) -> bool {
-        kind != BucketKind::Zonal
+        kind.supports_http()
             && matches!(
                 err.kind(),
                 ErrorKind::Unsupported | ErrorKind::PreconditionFailed

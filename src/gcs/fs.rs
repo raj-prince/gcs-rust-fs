@@ -26,8 +26,8 @@ use crate::gcs::layout::BucketKind;
 use crate::gcs::path::{GcsPath, Loc};
 use crate::gcs::write::UploadSpec;
 use crate::options::{
-    CopyOptions, FindOptions, ListOptions, MkdirOptions, OpenMode, OpenOptions, RmOptions,
-    WriteOptions,
+    CopyOptions, FindOptions, ListOptions, MkdirOptions, OpenMode, OpenOptions, ReadOptions,
+    RmOptions, WriteOptions,
 };
 use crate::range::{ByteRange, ResolvedRange};
 use crate::stat::ObjectStat;
@@ -141,7 +141,7 @@ impl GcsFsBuilder {
 /// — see [`BucketKind`] for what differs.
 ///
 /// ```no_run
-/// use gcs_rust_fs::{ByteRange, FileSystem, GcsFs, OpenOptions};
+/// use gcs_rust_fs::{ByteRange, FileSystem, GcsFs, OpenOptions, ReadOptions};
 ///
 /// # async fn demo() -> gcs_rust_fs::Result<()> {
 /// let fs = GcsFs::new().await?;
@@ -149,7 +149,9 @@ impl GcsFsBuilder {
 /// let info = fs.info("my-bucket/checkpoint.pt").await?;
 /// println!("{} bytes", info.size);
 ///
-/// let header = fs.cat_file("my-bucket/checkpoint.pt", ByteRange::head(1024)).await?;
+/// let header = fs
+///     .cat_file("my-bucket/checkpoint.pt", ByteRange::head(1024), ReadOptions::default())
+///     .await?;
 /// assert!(header.len() <= 1024);
 ///
 /// let mut file = fs.open("my-bucket/out.txt", OpenOptions::write()).await?;
@@ -443,7 +445,7 @@ impl GcsFs {
     ) -> Result<()> {
         match self.backend.move_object(src, dst.object()).await {
             Ok(_) => Ok(()),
-            Err(e) if kind == BucketKind::Zonal => Err(e),
+            Err(e) if !kind.supports_server_copy() => Err(e),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -578,8 +580,7 @@ impl FileSystem for GcsFs {
                 bucket: loc.bucket(),
                 prefix: &prefix,
                 delimiter: true,
-                // Hierarchical buckets have no object versioning.
-                versions: opts.versions && !kind.is_hierarchical(),
+                versions: opts.versions && kind.has_versioning(),
                 include_folders: kind.is_hierarchical(),
                 limit: None,
             })
@@ -641,7 +642,7 @@ impl FileSystem for GcsFs {
                 Ok(Box::new(GcsFile::writer(loc.path(), opts.mode, writer)))
             }
             OpenMode::Append => {
-                if kind != BucketKind::Zonal {
+                if !kind.objects_appendable() {
                     return Err(Error::unsupported(format!(
                         "append mode on {} ({kind} bucket): objects are immutable; only zonal buckets support appends",
                         loc.path()
@@ -806,7 +807,7 @@ impl FileSystem for GcsFs {
         debug!(path = %loc.path(), ?opts, %kind, "find");
         let bucket = loc.bucket();
         let prefix = loc.prefix();
-        let versions = opts.versions && !kind.is_hierarchical();
+        let versions = opts.versions && kind.has_versioning();
         let (listing, folders) = tokio::join!(
             self.backend.list_objects(ListRequest {
                 bucket,
@@ -881,7 +882,9 @@ impl FileSystem for GcsFs {
 
     /// One ranged read; ranges mixing a negative bound with another bound
     /// cost an extra `GetObject` and are then pinned to that generation.
-    async fn cat_file(&self, path: &str, range: ByteRange) -> Result<Bytes> {
+    async fn cat_file(&self, path: &str, range: ByteRange, opts: ReadOptions) -> Result<Bytes> {
+        // Destructured so a new `ReadOptions` field must be handled here.
+        let ReadOptions {} = opts;
         let (loc, kind, object) = self.object_loc(path).await?;
         debug!(path = %loc.path(), ?range, "cat_file");
         let (object, resolved) = if range.needs_size() {
@@ -921,7 +924,7 @@ impl FileSystem for GcsFs {
 
     async fn put_file(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<()> {
         let (loc, kind, object) = self.object_loc(path).await?;
-        if kind == BucketKind::Zonal {
+        if kind.objects_appendable() {
             // Appendable objects take the streaming path.
             return derived::put_file(self, local, path, opts).await;
         }
@@ -942,7 +945,7 @@ impl FileSystem for GcsFs {
         let ((src_loc, src_kind, src_obj), (dst_loc, dst_kind, dst_obj)) =
             tokio::try_join!(self.object_loc(src), self.object_loc(dst))?;
         debug!(src = %src_loc.path(), dst = %dst_loc.path(), "copy_file");
-        if src_kind == BucketKind::Zonal || dst_kind == BucketKind::Zonal {
+        if !src_kind.supports_server_copy() || !dst_kind.supports_server_copy() {
             return Err(Error::unsupported(format!(
                 "copy_file {} -> {}: zonal buckets have no server-side copy; download and upload instead",
                 src_loc.path(),
@@ -985,7 +988,7 @@ impl FileSystem for GcsFs {
                 Err(e) => Err(self.refine_not_found(&src_loc, src_kind, e).await),
             };
         }
-        if src_kind == BucketKind::Zonal || dst_kind == BucketKind::Zonal {
+        if !src_kind.supports_server_copy() || !dst_kind.supports_server_copy() {
             return Err(Error::unsupported(format!(
                 "move_file {} -> {}: moves out of or into a zonal bucket need a download and upload",
                 src_loc.path(),

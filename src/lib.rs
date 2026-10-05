@@ -39,13 +39,15 @@
 //! | `Zonal` (Rapid Storage) | as hierarchical | gRPC only; appendable objects (`flush` persists, [`OpenMode::Append`] works); no server-side copy |
 //!
 //! ```no_run
-//! use gcs_rust_fs::{ByteRange, FileSystem, FindOptions, GcsFs, OpenOptions, Transport};
+//! use gcs_rust_fs::{ByteRange, FileSystem, FindOptions, GcsFs, OpenOptions, ReadOptions, Transport};
 //!
 //! # async fn demo() -> gcs_rust_fs::Result<()> {
 //! let fs = GcsFs::builder().transport(Transport::Grpc).build().await?;
 //!
 //! let info = fs.info("gs://my-bucket/checkpoint.pt").await?;
-//! let first_mib = fs.cat_file("my-bucket/checkpoint.pt", ByteRange::head(1 << 20)).await?;
+//! let first_mib = fs
+//!     .cat_file("my-bucket/checkpoint.pt", ByteRange::head(1 << 20), ReadOptions::default())
+//!     .await?;
 //! let everything = fs.find("my-bucket/data", FindOptions::default()).await?;
 //!
 //! let mut out = fs.open("my-bucket/out.bin", OpenOptions::write()).await?;
@@ -91,8 +93,8 @@ pub use filesystem::FileSystem;
 pub use gcs::{BucketKind, BucketSpec, GcsFile, GcsFs, GcsFsBuilder, Transport, PROJECT_ENV_VARS};
 pub use options::{
     BulkOptions, CopyOptions, DuOptions, FindOptions, GlobOptions, ListOptions, MkdirOptions,
-    OnError, OpenMode, OpenOptions, PutOptions, RmOptions, WalkOptions, WriteMode, WriteOptions,
-    DEFAULT_CONCURRENCY,
+    OnError, OpenMode, OpenOptions, PutOptions, ReadOptions, RmOptions, WalkOptions, WriteMode,
+    WriteOptions, DEFAULT_CONCURRENCY,
 };
 pub use range::ByteRange;
 pub use stat::ObjectStat;

@@ -21,7 +21,7 @@ use crate::filesystem::FileSystem;
 use crate::glob;
 use crate::options::{
     BulkOptions, CopyOptions, DuOptions, FindOptions, GlobOptions, ListOptions, OnError,
-    OpenOptions, PutOptions, RmOptions, WalkOptions, WriteOptions,
+    OpenOptions, PutOptions, ReadOptions, RmOptions, WalkOptions, WriteOptions,
 };
 use crate::range::ByteRange;
 
@@ -106,8 +106,9 @@ pub(crate) async fn cat_file<F: FileSystem + ?Sized>(
     fs: &F,
     path: &str,
     range: ByteRange,
+    opts: ReadOptions,
 ) -> Result<Bytes> {
-    let file = fs.open(path, OpenOptions::read()).await?;
+    let file = fs.open(path, OpenOptions::from_read(opts)).await?;
     file.read_range(range).await
 }
 
@@ -167,8 +168,9 @@ pub(crate) async fn get_file<F: FileSystem + ?Sized>(
     fs: &F,
     path: &str,
     local: &Path,
+    opts: ReadOptions,
 ) -> Result<()> {
-    let mut file = fs.open(path, OpenOptions::read()).await?;
+    let mut file = fs.open(path, OpenOptions::from_read(opts)).await?;
     if let Some(parent) = local.parent().filter(|p| !p.as_os_str().is_empty()) {
         tokio::fs::create_dir_all(parent)
             .await
@@ -354,7 +356,9 @@ pub(crate) async fn cat<F: FileSystem + ?Sized>(
     let owned: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
     let mut results = stream::iter(owned)
         .map(|path| async move {
-            let result = fs.cat_file(&path, ByteRange::ALL).await;
+            let result = fs
+                .cat_file(&path, ByteRange::ALL, ReadOptions::default())
+                .await;
             (path, result)
         })
         .buffered(opts.concurrency.max(1));
@@ -379,7 +383,7 @@ pub(crate) async fn cat_ranges<F: FileSystem + ?Sized>(
         .map(|(path, range)| (path.to_string(), *range))
         .collect();
     let mut results = stream::iter(owned)
-        .map(|(path, range)| async move { fs.cat_file(&path, range).await })
+        .map(|(path, range)| async move { fs.cat_file(&path, range, ReadOptions::default()).await })
         .buffered(opts.concurrency.max(1));
     let mut out = Vec::with_capacity(requests.len());
     while let Some(result) = results.next().await {

@@ -26,7 +26,7 @@ use std::process::ExitCode;
 
 use gcs_rust_fs::{
     ByteRange, CopyOptions, DuOptions, Entry, FileSystem, FindOptions, GcsFs, ListOptions,
-    MkdirOptions, RmOptions, Transport, WalkOptions, WriteOptions,
+    MkdirOptions, ReadOptions, RmOptions, Transport, WalkOptions, WriteOptions,
 };
 
 struct Args {
@@ -143,13 +143,19 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         "cat" => {
             let range = ByteRange::new(args.start, args.end);
-            let bytes = fs.cat_file(args.arg(0, "path")?, range).await?;
+            let bytes = fs
+                .cat_file(args.arg(0, "path")?, range, ReadOptions::default())
+                .await?;
             use std::io::Write as _;
             std::io::stdout().write_all(&bytes)?;
         }
         "get" => {
-            fs.get_file(args.arg(0, "path")?, Path::new(args.arg(1, "local path")?))
-                .await?;
+            fs.get_file(
+                args.arg(0, "path")?,
+                Path::new(args.arg(1, "local path")?),
+                ReadOptions::default(),
+            )
+            .await?;
         }
         "put" => {
             fs.put_file(

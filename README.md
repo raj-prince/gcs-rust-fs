@@ -102,7 +102,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ```rust
-use gcs_rust_fs::{ByteRange, FileSystem, FindOptions, GcsFs, OpenOptions, RmOptions, WriteOptions};
+use gcs_rust_fs::{
+    ByteRange, FileSystem, FindOptions, GcsFs, OpenOptions, ReadOptions, RmOptions, WriteOptions,
+};
 
 #[tokio::main]
 async fn main() -> gcs_rust_fs::Result<()> {
@@ -111,8 +113,12 @@ async fn main() -> gcs_rust_fs::Result<()> {
     let info = fs.info("gs://my-bucket/checkpoint.pt").await?;
     println!("{} {} bytes", info.kind.as_str(), info.size);
 
-    let header = fs.cat_file("my-bucket/checkpoint.pt", ByteRange::head(1 << 20)).await?;
-    let footer = fs.cat_file("my-bucket/checkpoint.pt", ByteRange::tail(64)).await?;
+    let header = fs
+        .cat_file("my-bucket/checkpoint.pt", ByteRange::head(1 << 20), ReadOptions::default())
+        .await?;
+    let footer = fs
+        .cat_file("my-bucket/checkpoint.pt", ByteRange::tail(64), ReadOptions::default())
+        .await?;
 
     for entry in fs.find("my-bucket/data", FindOptions::default()).await? {
         println!("{:>12} {}", entry.size, entry.path);

@@ -22,8 +22,8 @@ use std::sync::OnceLock;
 use bytes::Bytes;
 use gcs_rust_fs::{
     BucketKind, ByteRange, CopyOptions, Entry, ErrorKind, FileSystem, FindOptions, GcsFs,
-    ListOptions, MkdirOptions, OpenMode, OpenOptions, RmOptions, WalkOptions, WriteMode,
-    WriteOptions,
+    ListOptions, MkdirOptions, OpenMode, OpenOptions, ReadOptions, RmOptions, WalkOptions,
+    WriteMode, WriteOptions,
 };
 
 const OBJECT_VAR: &str = "GCS_RUST_FS_TEST_OBJECT";
@@ -139,30 +139,53 @@ async fn cat_file_ranges_are_consistent_with_full_read() {
     let fs = fs().await;
     eprintln!("transport: {}", fs.transport());
 
-    let all = fs.cat_file(&path, ByteRange::ALL).await.expect("full read");
+    let all = fs
+        .cat_file(&path, ByteRange::ALL, ReadOptions::default())
+        .await
+        .expect("full read");
     let size = fs.size(&path).await.unwrap();
     assert_eq!(all.len() as u64, size);
     assert!(all.len() >= 16, "test object should be at least 16 bytes");
 
-    let head = fs.cat_file(&path, ByteRange::head(10)).await.unwrap();
+    let head = fs
+        .cat_file(&path, ByteRange::head(10), ReadOptions::default())
+        .await
+        .unwrap();
     assert_eq!(&head[..], &all[..10]);
-    let tail = fs.cat_file(&path, ByteRange::tail(7)).await.unwrap();
+    let tail = fs
+        .cat_file(&path, ByteRange::tail(7), ReadOptions::default())
+        .await
+        .unwrap();
     assert_eq!(&tail[..], &all[all.len() - 7..]);
-    let span = fs.cat_file(&path, ByteRange::span(3, 12)).await.unwrap();
+    let span = fs
+        .cat_file(&path, ByteRange::span(3, 12), ReadOptions::default())
+        .await
+        .unwrap();
     assert_eq!(&span[..], &all[3..12]);
     let mixed = fs
-        .cat_file(&path, ByteRange::new(Some(2), Some(-2)))
+        .cat_file(
+            &path,
+            ByteRange::new(Some(2), Some(-2)),
+            ReadOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(&mixed[..], &all[2..all.len() - 2]);
 
     // Python-slice semantics: past the end is empty, not an error.
     let beyond = fs
-        .cat_file(&path, ByteRange::from_offset(size + 10))
+        .cat_file(
+            &path,
+            ByteRange::from_offset(size + 10),
+            ReadOptions::default(),
+        )
         .await
         .unwrap();
     assert!(beyond.is_empty());
-    let empty = fs.cat_file(&path, ByteRange::span(5, 5)).await.unwrap();
+    let empty = fs
+        .cat_file(&path, ByteRange::span(5, 5), ReadOptions::default())
+        .await
+        .unwrap();
     assert!(empty.is_empty());
 }
 
@@ -170,7 +193,10 @@ async fn cat_file_ranges_are_consistent_with_full_read() {
 async fn open_read_seek_and_positional_reads() {
     let Some(path) = test_object() else { return };
     let fs = fs().await;
-    let all = fs.cat_file(&path, ByteRange::ALL).await.unwrap();
+    let all = fs
+        .cat_file(&path, ByteRange::ALL, ReadOptions::default())
+        .await
+        .unwrap();
 
     let mut file = fs
         .open(
@@ -223,7 +249,7 @@ async fn missing_paths_are_not_found() {
     );
     assert!(!fs.exists(&missing).await.unwrap());
     assert_eq!(
-        fs.cat_file(&missing, ByteRange::ALL)
+        fs.cat_file(&missing, ByteRange::ALL, ReadOptions::default())
             .await
             .unwrap_err()
             .kind(),
@@ -319,13 +345,22 @@ async fn write_and_read_back(fs: GcsFs, root: String) {
     assert!(fs.is_dir(&format!("{root}/data")).await.unwrap());
     assert!(fs.is_dir(&root).await.unwrap());
 
-    assert_eq!(fs.cat_file(&file, ByteRange::ALL).await.unwrap(), data);
     assert_eq!(
-        &fs.cat_file(&file, ByteRange::span(100, 200)).await.unwrap()[..],
+        fs.cat_file(&file, ByteRange::ALL, ReadOptions::default())
+            .await
+            .unwrap(),
+        data
+    );
+    assert_eq!(
+        &fs.cat_file(&file, ByteRange::span(100, 200), ReadOptions::default())
+            .await
+            .unwrap()[..],
         &data[100..200]
     );
     assert_eq!(
-        &fs.cat_file(&file, ByteRange::tail(9)).await.unwrap()[..],
+        &fs.cat_file(&file, ByteRange::tail(9), ReadOptions::default())
+            .await
+            .unwrap()[..],
         &data[data.len() - 9..]
     );
 
@@ -411,7 +446,9 @@ async fn streaming_open_write_then_read(fs: GcsFs, kind: BucketKind, root: Strin
         .expect("put_file");
     assert_eq!(fs.size(&remote).await.unwrap(), 12_345);
     let back = dir.join("down.bin");
-    fs.get_file(&remote, &back).await.expect("get_file");
+    fs.get_file(&remote, &back, ReadOptions::default())
+        .await
+        .expect("get_file");
     assert_eq!(tokio::fs::read(&back).await.unwrap(), payload(12_345));
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
@@ -587,7 +624,10 @@ async fn directories_listing_and_walk(fs: GcsFs, kind: BucketKind, root: String)
 
     // file-vs-directory errors
     assert_eq!(
-        fs.cat_file(&tree, ByteRange::ALL).await.unwrap_err().kind(),
+        fs.cat_file(&tree, ByteRange::ALL, ReadOptions::default())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::IsADirectory
     );
     assert_eq!(
@@ -733,7 +773,9 @@ async fn append_mode(fs: GcsFs, kind: BucketKind, root: String) {
     w.write(Bytes::from_static(b"hello ")).await.unwrap();
     w.flush().await.unwrap();
     assert_eq!(
-        fs.cat_file(&file, ByteRange::ALL).await.unwrap(),
+        fs.cat_file(&file, ByteRange::ALL, ReadOptions::default())
+            .await
+            .unwrap(),
         Bytes::from_static(b"hello ")
     );
     w.write(Bytes::from_static(b"world")).await.unwrap();
@@ -749,7 +791,9 @@ async fn append_mode(fs: GcsFs, kind: BucketKind, root: String) {
     a.write(Bytes::from_static(b"!")).await.unwrap();
     a.close().await.unwrap();
     assert_eq!(
-        fs.cat_file(&file, ByteRange::ALL).await.unwrap(),
+        fs.cat_file(&file, ByteRange::ALL, ReadOptions::default())
+            .await
+            .unwrap(),
         Bytes::from_static(b"hello world!")
     );
     // "ab" on a missing object creates it

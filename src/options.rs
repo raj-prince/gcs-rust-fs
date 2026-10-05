@@ -97,6 +97,17 @@ pub struct WriteOptions {
     pub block_size: Option<usize>,
 }
 
+/// Options for whole-file reads (`cat_file`, `get_file`).
+///
+/// There are no per-read knobs yet; the struct exists so that future ones
+/// (parallel range requests, checksum verification, ...) can be added without
+/// changing the [`FileSystem`](crate::FileSystem) signatures. It is
+/// `#[non_exhaustive]`, so callers outside this crate construct it with
+/// [`ReadOptions::default()`] and keep compiling when fields appear.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {}
+
 /// Options for [`FileSystem::open`](crate::FileSystem::open).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpenOptions {
@@ -131,6 +142,14 @@ impl OpenOptions {
             mode,
             ..Self::default()
         }
+    }
+
+    /// Translate whole-file [`ReadOptions`] into the equivalent open options.
+    pub fn from_read(opts: ReadOptions) -> Self {
+        // Destructured rather than ignored so that adding a field to
+        // `ReadOptions` fails to compile here until it is forwarded.
+        let ReadOptions {} = opts;
+        Self::read()
     }
 
     /// Translate whole-file [`WriteOptions`] into the equivalent open options.

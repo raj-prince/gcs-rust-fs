@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use gcs_rust_fs::{
     async_trait, BulkOptions, ByteRange, CopyOptions, DuOptions, Entry, Error, ErrorKind, File,
     FileSystem, FindOptions, GlobOptions, ListOptions, MkdirOptions, ObjectStat, OnError, OpenMode,
-    OpenOptions, PutOptions, Result, RmOptions, WalkOptions, WriteMode, WriteOptions,
+    OpenOptions, PutOptions, ReadOptions, Result, RmOptions, WalkOptions, WriteMode, WriteOptions,
 };
 
 // ===========================================================================
@@ -734,7 +734,7 @@ async fn cat_and_cat_ranges_preserve_order_and_honour_on_error() {
     assert_eq!(text(ranges[3].as_ref().unwrap()), "b");
 
     assert_eq!(
-        fs.cat_file("b/data", ByteRange::ALL)
+        fs.cat_file("b/data", ByteRange::ALL, ReadOptions::default())
             .await
             .unwrap_err()
             .kind(),
@@ -795,7 +795,11 @@ async fn file_handle_contract() {
     assert_eq!(w.size(), Some(3));
     assert_eq!(w.stat().unwrap().size, 3);
     assert_eq!(
-        text(&fs.cat_file("b/w.txt", ByteRange::ALL).await.unwrap()),
+        text(
+            &fs.cat_file("b/w.txt", ByteRange::ALL, ReadOptions::default())
+                .await
+                .unwrap()
+        ),
         "abc"
     );
 
@@ -857,7 +861,11 @@ async fn pipe_put_get_round_trip() {
     .await
     .unwrap();
     assert_eq!(
-        text(&fs.cat_file("b/new/file.bin", ByteRange::ALL).await.unwrap()),
+        text(
+            &fs.cat_file("b/new/file.bin", ByteRange::ALL, ReadOptions::default())
+                .await
+                .unwrap()
+        ),
         "hello"
     );
     assert!(fs.is_dir("b/new").await.unwrap());
@@ -912,9 +920,13 @@ async fn pipe_put_get_round_trip() {
     );
     assert_eq!(
         text(
-            &fs.cat_file("b/upload/sub/two.txt", ByteRange::ALL)
-                .await
-                .unwrap()
+            &fs.cat_file(
+                "b/upload/sub/two.txt",
+                ByteRange::ALL,
+                ReadOptions::default()
+            )
+            .await
+            .unwrap()
         ),
         "22"
     );
@@ -952,10 +964,15 @@ async fn pipe_put_get_round_trip() {
     assert!(fs.is_file("b/dest/one.txt").await.unwrap());
 
     let target = dir.join("out/nested/got.txt");
-    fs.get_file("b/upload/sub/two.txt", &target).await.unwrap();
+    fs.get_file("b/upload/sub/two.txt", &target, ReadOptions::default())
+        .await
+        .unwrap();
     assert_eq!(tokio::fs::read(&target).await.unwrap(), b"22");
     assert_eq!(
-        fs.get_file("b/missing", &target).await.unwrap_err().kind(),
+        fs.get_file("b/missing", &target, ReadOptions::default())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::NotFound
     );
 
@@ -1126,7 +1143,11 @@ async fn copy_destination_rules() {
         .await
         .unwrap();
     assert_eq!(
-        text(&fs.cat_file("b/copy.txt", ByteRange::ALL).await.unwrap()),
+        text(
+            &fs.cat_file("b/copy.txt", ByteRange::ALL, ReadOptions::default())
+                .await
+                .unwrap()
+        ),
         "root"
     );
     // File into an existing directory, or into a `dst/`.
@@ -1209,7 +1230,11 @@ async fn mv_moves_and_cleans_up_the_source() {
         .unwrap();
     assert!(!fs.exists("b/root.txt").await.unwrap());
     assert_eq!(
-        text(&fs.cat_file("b/moved.txt", ByteRange::ALL).await.unwrap()),
+        text(
+            &fs.cat_file("b/moved.txt", ByteRange::ALL, ReadOptions::default())
+                .await
+                .unwrap()
+        ),
         "root"
     );
 

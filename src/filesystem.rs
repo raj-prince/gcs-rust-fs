@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::file::File;
 use crate::options::{
     BulkOptions, CopyOptions, DuOptions, FindOptions, GlobOptions, ListOptions, MkdirOptions,
-    OpenOptions, PutOptions, RmOptions, WalkOptions, WriteOptions,
+    OpenOptions, PutOptions, ReadOptions, RmOptions, WalkOptions, WriteOptions,
 };
 use crate::range::ByteRange;
 
@@ -134,11 +134,12 @@ pub trait FileSystem: Send + Sync {
     }
 
     /// Read a byte range of a file into memory (Python-slice semantics for
-    /// `range`; see [`ByteRange`]).
+    /// `range`; see [`ByteRange`]). `opts` carries per-read knobs; pass
+    /// [`ReadOptions::default()`] unless one is needed.
     ///
     /// The default opens the file and performs one positional read.
-    async fn cat_file(&self, path: &str, range: ByteRange) -> Result<Bytes> {
-        derived::cat_file(self, path, range).await
+    async fn cat_file(&self, path: &str, range: ByteRange, opts: ReadOptions) -> Result<Bytes> {
+        derived::cat_file(self, path, range, opts).await
     }
 
     /// Create or replace the file at `path` with `data` in one call.
@@ -153,8 +154,8 @@ pub trait FileSystem: Send + Sync {
 
     /// Download the file at `path` to the local path `local`, creating parent
     /// directories as needed.
-    async fn get_file(&self, path: &str, local: &Path) -> Result<()> {
-        derived::get_file(self, path, local).await
+    async fn get_file(&self, path: &str, local: &Path, opts: ReadOptions) -> Result<()> {
+        derived::get_file(self, path, local, opts).await
     }
 
     /// Copy one file to a new path, replacing any existing file there.
