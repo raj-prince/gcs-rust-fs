@@ -171,6 +171,8 @@ tests/cache.rs                  CachedFs tests on it
 tests/live.rs                   real-bucket tests (env-gated, per bucket kind)
 examples/gcs.rs                 CLI binary
 docs/filesystem_api_design.md   behavioural spec and decisions
+docs/dir_cache_design.md        CachedFs directory cache: design as built
+docs/page_cache_design.md       readahead + page cache for data reads: proposal
 .cargo/config.toml              enables the SDK's appendable-object API
 ```
 

@@ -309,7 +309,9 @@ so the bridge can hold `Arc<dyn FileSystem>` either way. One store serves both
 read primitives: a `ls` fills a directory node with its complete listing, and
 `info` on any child is then answered from it; an individual `info` result is
 kept in a *partial* node that can never be mistaken for a listing. Eviction is
-per directory node, so a listing is served whole or not at all.
+per directory node, so a listing is served whole or not at all. The design and
+its rationale are in [`dir_cache_design.md`](dir_cache_design.md); the planned
+data half of the same decorator in [`page_cache_design.md`](page_cache_design.md).
 
 | Aspect | Behaviour | gcsfs/fsspec counterpart |
 |---|---|---|

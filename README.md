@@ -147,7 +147,10 @@ SDK's `google_cloud_unstable_storage_bidi` cfg — this repo sets it in
 works either way) and gives `ls` and `info` the `fsspec` directory-cache
 behaviour that `gcsfs` users rely on, with both served from **one** store: a
 listing warms `info` for every child, and individual `info` results are kept
-without ever being mistaken for a complete listing.
+without ever being mistaken for a complete listing. Design and rationale:
+[`docs/dir_cache_design.md`](docs/dir_cache_design.md); the planned data
+half (readahead and page cache):
+[`docs/page_cache_design.md`](docs/page_cache_design.md).
 
 ```rust
 use bytes::Bytes;
