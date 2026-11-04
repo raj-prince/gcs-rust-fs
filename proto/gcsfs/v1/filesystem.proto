@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+package gcsfs.v1;
+
+// Sidecar file-system service backed by `gcs-rust-fs`.
+//
+// Phase 1 exposes `Info`, `Read`, and `Write`. The sidecar defaults its
+// Google Cloud Storage data path to `Transport::Http` (JSON API with `Range`
+// headers and resumable uploads) while communicating with local `gcsfs`
+// clients over a Unix Domain Socket (or TCP loopback).
+service FileSystemService {
+  // Describe a path: returns a File entry, a Directory entry, or NOT_FOUND.
+  rpc Info(InfoRequest) returns (InfoResponse);
+
+  // List children of a directory path or matching a prefix.
+  rpc List(ListRequest) returns (ListResponse);
+
+  // Read a byte range (or whole file) as a stream of byte chunks.
+  rpc Read(ReadRequest) returns (stream ReadResponse);
+
+  // Write a file by streaming a WriteSpec header followed by byte chunks.
+  // The file is published atomically when the client half-closes the stream.
+  // If the client cancels or resets the stream before closing, the upload is
+  // discarded and nothing is published.
+  rpc Write(stream WriteRequest) returns (WriteResponse);
+}
+
+// ============================================================================
+// Info
+// ============================================================================
+
+message InfoRequest {
+  // Path in `bucket/key`, `gs://bucket/key`, or `bucket/key#generation` form.
+  string path = 1;
+}
+
+message InfoResponse {
+  Entry entry = 1;
+}
+
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIRECTORY = 2;
+}
+
+message Entry {
+  string path = 1;
+  EntryKind kind = 2;
+  uint64 size = 3;
+  optional ObjectStat stat = 4;
+}
+
+message ObjectStat {
+  string bucket = 1;
+  string name = 2;
+  uint64 size = 3;
+  int64 generation = 4;
+  int64 metageneration = 5;
+  string content_type = 6;
+  optional string content_encoding = 7;
+  optional string cache_control = 8;
+  optional string content_disposition = 9;
+  optional string content_language = 10;
+  string storage_class = 11;
+  string etag = 12;
+  optional uint32 crc32c = 13;
+  optional string md5_hash = 14;
+  optional string kms_key = 15;
+  optional int32 component_count = 16;
+  optional string time_created = 17;
+  optional string updated = 18;
+  optional string custom_time = 19;
+  map<string, string> metadata = 20;
+}
+
+// ============================================================================
+// List
+// ============================================================================
+
+message ListRequest {
+  // Directory path or prefix to list (e.g. `bucket/dir`, `gs://bucket`, or `""`).
+  string path = 1;
+  // If true, list every version/generation of each file.
+  bool versions = 2;
+  // If true, bypass cached listings and fetch directly from storage.
+  bool refresh = 3;
+}
+
+message ListResponse {
+  repeated Entry entries = 1;
+}
+
+// ============================================================================
+// Read
+// ============================================================================
+
+// Half-open byte range [start, end) with Python-slice semantics.
+// Negative bounds count back from the end of the object; omitted bounds mean
+// start-of-file or end-of-file respectively.
+message ByteRange {
+  optional int64 start = 1;
+  optional int64 end = 2;
+}
+
+message ReadOptions {
+  // Server-side chunk size for streaming responses (default: 1 MiB).
+  optional uint64 chunk_size = 1;
+}
+
+message ReadRequest {
+  // Path in `bucket/key`, `gs://bucket/key`, or `bucket/key#generation` form.
+  string path = 1;
+  // Optional byte range. If omitted, reads the entire file (ByteRange::ALL).
+  optional ByteRange range = 2;
+  optional ReadOptions options = 3;
+}
+
+message ReadResponse {
+  // Raw file bytes for this chunk.
+  bytes data = 1;
+}
+
+// ============================================================================
+// Write
+// ============================================================================
+
+enum WriteMode {
+  WRITE_MODE_UNSPECIFIED = 0;
+  // Replace the file if it exists (default).
+  WRITE_MODE_OVERWRITE = 1;
+  // Fail with ALREADY_EXISTS if the file exists (if_generation_match = 0).
+  WRITE_MODE_CREATE = 2;
+}
+
+message WriteSpec {
+  string path = 1;
+  WriteMode mode = 2;
+  optional string content_type = 3;
+  map<string, string> metadata = 4;
+  optional uint64 block_size = 5;
+}
+
+message WriteRequest {
+  oneof payload {
+    // Must be sent as the first message on the stream.
+    WriteSpec spec = 1;
+    // Subsequent messages carry raw byte chunks to append to the upload.
+    bytes data = 2;
+  }
+}
+
+message WriteResponse {
+  // Total bytes persisted.
+  uint64 size = 1;
+  // Resulting object metadata (present whenever finalized on close).
+  optional ObjectStat stat = 2;
+}
