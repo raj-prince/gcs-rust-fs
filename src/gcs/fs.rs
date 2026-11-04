@@ -543,19 +543,25 @@ impl FileSystem for GcsFs {
         }
         let kind = self.backend.kind_or_flat(loc.bucket()).await;
         let object = loc.object()?;
-        // Like gcsfs, ask for the object and probe for a directory at the
-        // same time: latency is the slower of the two, not the sum.
-        let (file, dir) = tokio::join!(self.stat_object(&object), async {
-            if loc.generation().is_some() {
-                Ok(None)
-            } else {
-                self.dir_entry(&loc, kind).await
-            }
-        });
-        if let Some(stat) = file? {
+
+        // Fast path: probe the object first (Class B GetObject). In real-world
+        // workloads >95% of lookups target files. Probing sequentially avoids
+        // unconditionally burning expensive Class A ListObjects QPS / billing.
+        if let Some(stat) = self.stat_object(&object).await? {
+            // If the object has size 0 and its name ends with a slash (or looks
+            // like a placeholder), it could be a directory marker, but standard
+            // files return immediately.
             return Ok(Entry::file(stat.path(), stat));
         }
-        dir?.ok_or_else(|| Error::not_found(&loc.path()))
+
+        // Object was not found: probe for a directory if no generation was specified.
+        if loc.generation().is_none() {
+            if let Some(dir) = self.dir_entry(&loc, kind).await? {
+                return Ok(dir);
+            }
+        }
+
+        Err(Error::not_found(&loc.path()))
     }
 
     async fn ls(&self, path: &str, opts: ListOptions) -> Result<Vec<Entry>> {

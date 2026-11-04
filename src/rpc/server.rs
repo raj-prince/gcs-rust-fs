@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::error::Error;
 use crate::filesystem::FileSystem;
-use crate::options::{ListOptions, OpenOptions, ReadOptions, WriteOptions};
+use crate::options::{ListOptions, OpenOptions, WriteOptions};
 use crate::range::ByteRange;
 use crate::rpc::convert::{error_to_status, ERROR_KIND_HEADER};
 use crate::rpc::proto::file_system_service_server::{
@@ -242,27 +242,59 @@ impl FileSystemService for FileSystemRpcService {
         let range = req.range.map(ByteRange::from).unwrap_or(ByteRange::ALL);
         debug!(path = %req.path, ?range, chunk_size, "rpc Read");
 
-        // Fetch the requested byte range via `cat_file` (which uses the
-        // single-request HTTP Range or gRPC path on `GcsFs`).
-        let data = self
+        // Stream chunks via `fs.open` to avoid buffering whole multi-gigabyte
+        // files into memory (preventing sidecar daemon OOM).
+        let mut handle = self
             .fs
-            .cat_file(&req.path, range, ReadOptions::default())
+            .open(&req.path, OpenOptions::read())
             .await
             .map_err(error_to_status)?;
 
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
-            if data.is_empty() {
+            let file_size = match handle.size() {
+                Some(s) => s,
+                None => {
+                    // Fall back to stat if size is somehow None
+                    match handle.stat() {
+                        Some(stat) => stat.size,
+                        None => 0,
+                    }
+                }
+            };
+
+            let std_range = range.clamp(file_size);
+            let start = std_range.start;
+            let end = std_range.end;
+
+            if start >= end {
                 return;
             }
-            let mut offset = 0;
-            while offset < data.len() {
-                let end = (offset + chunk_size).min(data.len());
-                let slice = data.slice(offset..end);
-                if tx.send(Ok(ReadResponse { data: slice })).await.is_err() {
-                    break;
+
+            if let Err(e) = handle.seek(std::io::SeekFrom::Start(start)) {
+                let _ = tx.send(Err(error_to_status(e))).await;
+                return;
+            }
+
+            let mut remaining = end - start;
+            while remaining > 0 {
+                let to_read = (chunk_size as u64).min(remaining) as usize;
+                match handle.read(Some(to_read)).await {
+                    Ok(chunk) => {
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        let len = chunk.len() as u64;
+                        remaining = remaining.saturating_sub(len);
+                        if tx.send(Ok(ReadResponse { data: chunk })).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(error_to_status(e))).await;
+                        break;
+                    }
                 }
-                offset = end;
             }
         });
 

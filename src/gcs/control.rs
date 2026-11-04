@@ -8,7 +8,7 @@ use google_cloud_storage::model::bucket::{
     CustomPlacementConfig, HierarchicalNamespace, IamConfig,
 };
 use google_cloud_storage::model::{Bucket, Folder, Object};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcs::backend::Backend;
@@ -260,7 +260,7 @@ impl Backend {
 
     /// Delete an empty bucket; a non-empty one is `DirectoryNotEmpty`.
     pub(crate) async fn delete_bucket(&self, bucket: &str) -> Result<()> {
-        debug!(bucket, "delete_bucket");
+        warn!(bucket, "delete_bucket: deleting bucket");
         self.control()
             .delete_bucket()
             .set_name(bucket_resource(bucket))

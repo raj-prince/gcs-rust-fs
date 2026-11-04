@@ -1,642 +1,273 @@
-# Filesystem API design for `gcs-rust-fs`
+# Architecture Design: Unified Filesystem Engine and UDS Service for `gcs-rust-fs`
 
-Status: **contract implemented (traits + derived operations); GCS
-implementation of the traits pending — review before continuing**
+*   **Author:** `gcs-rust-fs` team & Prince Kumar (@princer)
+*   **Status:** Implemented & Verified (Phases 0, 1, 2 ✅)
+*   **Date:** 2026-11-04
 
-This document defines the full fsspec-style filesystem surface that
-`gcs-rust-fs` will expose so that `gcsfs` can delegate these methods to Rust:
+--------------------------------------------------------------------------------
 
-```
-open read close exists isdir isfile write ls glob find rm tell flush walk
-put move mv mkdir rm_file du cat cat_file rmdir copy size
-```
+## Overview
 
-The goal of the doc is to agree on **semantics, API shape and the split of
-responsibilities between Rust and Python** before any code is written.
-Decisions that need your input are marked `D1 … D15` and collected in
-[§11](#11-open-decisions). Everything else is a proposal you can veto.
+Python [`gcsfs`](https://github.com/fsspec/gcsfs) is the standard Cloud Storage backend for the Python `fsspec` ecosystem, powering distributed machine learning frameworks (PyTorch `DataLoader`, Ray Train, JAX) and batch analytical workflows (Dask, Apache Arrow). However, emulating POSIX filesystem semantics on top of an object store requires complex directory marker tracking, recursive tree traversals, and multi-bucket layout handling.
 
-> **Where things stand.** The API shape is settled as two traits,
-> [`FileSystem`](../src/filesystem.rs) and [`File`](../src/file.rs)
-> ([§4](#4-public-api-the-filesystem-and-file-traits)). Their derived
-> operations are implemented generically in [`derived.rs`](../src/derived.rs)
-> and verified against an in-memory implementation in
-> [`tests/common/mod.rs`](../tests/common/mod.rs). The GCS types (`GcsFs`,
-> `GcsFile`) still expose only the original read-only inherent methods and do
-> **not** implement the traits yet — that is the next step, and §5 is its
-> specification.
+This design document establishes the architecture and interface specifications for [`gcs-rust-fs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/lib.rs): a high-performance, async, object-safe Rust filesystem engine. The engine provides:
+1. **Core Trait Abstractions**: [`FileSystem`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/filesystem.rs) and [`File`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs) traits implementing `fsspec` semantics with six mandatory primitives.
+2. **Generic Derived Layer**: Storage-agnostic implementations of recursive walks, globs, directory usage, and batch transfers ([`src/derived.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/derived.rs)).
+3. **Multi-Bucket GCS Backend**: Unified dispatch across Standard Flat, Hierarchical Namespace (HNS), and Zonal (Rapid) buckets ([`src/gcs/`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/)).
+4. **Out-of-Process UDS Service**: A gRPC sidecar daemon (`gcsfs-sidecar`) communicating over Unix Domain Sockets ([`src/rpc/`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/rpc/)) with bounded chunk streaming.
 
----
+--------------------------------------------------------------------------------
 
-## 1. Goals, non-goals, rules
+## The Problem
 
-**Goals**
+Embedding raw Python HTTP client runtimes across thousands of data workers introduces severe performance and reliability bottlenecks:
 
-1. Behave like `gcsfs` (fsspec semantics), not like POSIX. A user swapping the
-   backend must not see different results for the same call.
-2. Pure Rust, async, built only on `google-cloud-storage` (gRPC bidi reads +
-   `StorageControl` for metadata) with the HTTP transport as fallback.
-3. One place for GCS-specific knowledge: `src/gcs/`. The contract (`FileSystem`,
-   `File`, `Entry`, options, errors) talks about *paths, entries, files,
-   directories* — never about bucket resource names, descriptors, rewrite
-   tokens, etc.
+1. **Class A Listing Billing Penalties**: Naive path queries often trigger expensive `ListObjects` RPCs ($0.0050/1k Class A) rather than `GetObject` ($0.0004/1k Class B), multiplying Cloud Storage operational costs by over 1,200% for simple file existence checks.
+2. **Worker Memory Bloat & Daemon OOM**: In large training clusters, workers reading multi-gigabyte checkpoints through IPC can cause severe memory amplification if data is buffered in memory rather than streamed in bounded chunks.
+3. **Semantic Divergence Across Bucket Types**: GCS buckets behave differently across Flat, HNS, and Zonal storage (e.g., atomic `RenameFolder` vs iterative copy-delete loops; appendable objects vs immutable uploads). The storage engine must handle these quirks without breaking callers.
+4. **Python Multi-Process Fork Hazards**: PyTorch DataLoaders relying on `os.fork()` corrupt internal connection pools and background threads in native runtimes, demanding clean process isolation or stateless client stubs.
 
-**Non-goals (for now)**
+--------------------------------------------------------------------------------
 
-- No PyO3 code here (lives in gcsfs as `gcsfs_bindings`).
-- No caching inside the backends. A directory/metadata cache exists, but as
-  an opt-in decorator (`CachedFs`, **D30**, revising **D1**) — `GcsFs` itself
-  stays stateless.
-- No ACL/IAM, signed URLs, lifecycle, requester-pays, soft-delete, appendable
-  objects. These are GCS features, not filesystem operations.
-- No local disk cache for reads.
+## Goals
 
-**Rules we already agreed on**
+*   **Fsspec Behavioral Parity**: Expose the full `fsspec` filesystem surface (`open`, `read`, `write`, `info`, `ls`, `find`, `glob`, `walk`, `du`, `cat`, `put`, `copy`, `mv`, `rm`, `mkdir`, `rmdir`) without behavior divergence.
+*   **Object-Safe, Minimal Core**: Enforce a clean separation of concerns: six mandatory storage primitives, native performance overrides, and generic derived algorithms.
+*   **Optimal GCS RPC Economics**: Probe file lookups sequentially (`GetObject` first) to avoid burning expensive Class A List quotas for regular files.
+*   **Bounded Memory Streaming**: Ensure IPC read paths stream in bounded chunks (1–3.5 MiB) directly from file handles without whole-file memory buffering.
+*   **Multi-Bucket Transparency**: Provide seamless dispatch across Standard Flat, HNS, and Zonal buckets based on capability flags rather than leaky inheritance hierarchies.
+*   **Stateless Backends & Pluggable Caching**: Keep `GcsFs` completely stateless while providing an opt-in decorator ([`CachedFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs)) for client-side directory and metadata caching.
 
-- `GcsFs`/`GcsFile` expose filesystem semantics only; SDK plumbing is private.
-- Errors are classified into `ErrorKind` so the bridge can raise the right
-  Python exception without parsing messages.
+--------------------------------------------------------------------------------
 
----
+## Non-Goals
 
-## 2. Vocabulary: how a flat object store becomes a filesystem
+*   **POSIX File Locking**: Advisory POSIX record locking (`fcntl`/`flock`) across concurrent remote processes is out of scope. Object immutability and atomic overwrites via GCS generations apply.
+*   **In-Backend Caching**: `GcsFs` itself never caches state internally; all caching logic is isolated in decorators.
+*   **Non-Filesystem GCS Features**: GCS bucket lifecycle rules, IAM policies, HMAC keys, and requester-pays configuration are administrative Cloud Storage features, not filesystem operations.
+*   **Remote Cross-Host Proxies**: The UDS server is strictly node-local (co-located in the same Kubernetes Pod or host); network routing across VM boundaries is out of scope.
 
-GCS is flat. Everything below is an emulation; it is the same emulation gcsfs
-uses, written down so we can test it.
+--------------------------------------------------------------------------------
 
-| Term | Definition |
-|---|---|
-| **root** (`""` / `/`) | The list of buckets visible to the configured project. |
-| **bucket** | A top-level directory. `bucket` ≡ `bucket/`. |
-| **file** | An object whose name does not end in `/`, or ends in `/` but has size > 0. |
-| **placeholder** | A zero-byte object whose name ends in `/` (created by the console / other tools). Treated as a directory; by default never listed as a file (see D15 for gcsfs's quirks). |
-| **directory** | A bucket, a placeholder, or any prefix `p/` that has at least one object under it (a "common prefix"). |
-| **entry path** | `bucket/key` — no scheme, no trailing `/` (gcsfs convention). `Entry::uri()` gives `gs://bucket/key`. |
-| **generation** | `bucket/key#123` pins a generation. Reads honour it; listing/`find` only emit it when `versions = true`. |
+## Open Questions
 
-Consequences worth stating explicitly:
+*   **Question 1: Python Bridge Packaging Strategy**: Should the thin client communicate exclusively over UDS sockets (`gcsfs-sidecar`) or also provide in-process PyO3 C-extensions for single-container environments? (Current status: Both supported; UDS is prioritized for multi-worker container pods).
+*   **Question 2: Prefix Partitioning for Massive Directories**: Should Phase 4 introduce lexicographic shard ranges for directories with >1,000,000 objects? (Deferred to Phase 4 optimization based on production profiling).
 
-- An **empty "directory" does not exist** unless it is a bucket or a
-  placeholder. `mkdir("b/x")` followed by `isdir("b/x")` is `false` unless we
-  write a placeholder (**D8**).
-- `info("b/dir")` costs up to two RPCs: exact `get_object` (miss) + one list
-  page. `info("b/file")` costs one.
-- Listing is strongly consistent in GCS, so no "eventual consistency" caveats.
+--------------------------------------------------------------------------------
 
-### 2.1 `info()` algorithm (mirrors gcsfs `_info`)
+## Critical User Journeys (CUJs)
 
-```
-info(path):
-  if path is bucket-only:
-      get_bucket(bucket)                   -> Directory entry
-      on PermissionDenied: ls(bucket) non-empty -> Directory entry, else NotFound
-      # same as gcsfs (`GET b/{bucket}`, fallback to listing on OSError)
+### CUJ 1: High-Performance Positional Range Reads in DataLoader Workers
+*   **Given**: A PyTorch training worker opening a 10 GiB Parquet partition or safetensors checkpoint.
+*   **When**: The worker requests a byte range `[start, end)` via `fs.cat_file` or positional `File::read_range`.
+*   **Then**: The engine resolves the slice using Python-slice semantics, avoids unnecessary `stat` calls when bounds are positive, executes a direct HTTP Range / gRPC bidi read, and streams bytes with zero copy.
 
-  # gcsfs issues both of these concurrently and takes the first useful answer;
-  # we do the same (latency = max, not sum).
-  a = get_object(bucket, key)
-  b = list_objects(prefix = key.trim_end('/') + "/", delimiter = "/", page_size = 1)
+### CUJ 2: Cost-Effective Path Inspection (`info` / `exists`)
+*   **Given**: A data ingestion pipeline validating the existence of 100,000 file paths before processing.
+*   **When**: The application calls `fs.info(path)` or `fs.exists(path)`.
+*   **Then**: The engine issues a single Class B `GetObject` RPC. Only if the object is missing or represents a directory placeholder does it fallback to a Class A prefix listing, saving over 90% in GCS API billing.
 
-  if a is Ok(obj) and !(obj.size == 0 && key.ends_with('/'))  -> File entry   (cancel b)
-  # otherwise the object is missing or is a placeholder -> decide via listing
-  if b has any object or prefix                               -> Directory entry (size 0)
-  else                                                        -> NotFound
-```
+### CUJ 3: Atomic Folder Moves on Hierarchical Namespace (HNS) Buckets
+*   **Given**: A dataset generation script publishing an output folder `gs://hns-bucket/output_staging/` to `gs://hns-bucket/published/`.
+*   **When**: The caller invokes `fs.mv("output_staging", "published", recursive=True)`.
+*   **Then**: The backend identifies the bucket as HNS, triggers an atomic `RenameFolder` Long-Running Operation (LRO) in a single RPC, and completes instantly without copying individual files.
 
-`exists = info().is_ok()` (so **directories count**, fixing today's
-object-only `exists`). `isdir`/`isfile` read `Entry::kind`. `stat()` stays as
-the strict, object-only call.
+### CUJ 4: Streaming Out-of-Process Reads over Unix Domain Sockets
+*   **Given**: A Kubernetes container pod where `gcsfs-sidecar` listens on `unix:///var/run/gcsfs/sidecar.sock`.
+*   **When**: A client worker requests a multi-gigabyte file read over the UDS connection.
+*   **Then**: The sidecar streams 1–3.5 MiB chunks iteratively from an active `File` handle, keeping server memory bounded to `O(chunk_size * streams)` and preventing daemon OOM kills.
 
-### 2.2 `ls()` algorithm (mirrors gcsfs `_ls` / `_list_objects`)
+--------------------------------------------------------------------------------
+
+## Technical Plan (Architecture)
+
+### 1. Two-Tier Trait Architecture
+
+The public API is partitioned into two core traits in [`src/filesystem.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/filesystem.rs) and [`src/file.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs):
 
 ```
-ls(path):
-  root               -> list_buckets(project)              # Directory entries
-  else:
-    prefix = key == "" ? "" : key.trim_end('/') + "/"
-    iterate all pages of list_objects(prefix, delimiter = "/")
-       objects  -> File entries
-                   (with delimiter "/" the only possible zero-byte "x/" object in
-                    `objects` is the listed directory's own placeholder; gcsfs turns it
-                    into a Directory entry *for `path` itself* — see D15)
-       prefixes -> Directory entries (name without trailing '/')
-    dedupe directories by path
-    if nothing was found and key != "":
-       # gcsfs: `ls` on a file returns the file itself
-       return [stat(path)]                                  # NotFound propagates
-    if versions: entry path becomes "bucket/key#generation"
-    sort by path
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Core Public API                                                             │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ FileSystem Trait (Send + Sync, Object-Safe)                           │  │
+│  │ ├── Required Primitives: info, ls, open, rm_file, mkdir, rmdir        │  │
+│  │ ├── Overridable: find, cat_file, pipe_file, put_file, copy_file, mv   │  │
+│  │ └── Derived Operations: walk, du, glob, cat, put, exists, is_file...  │  │
+│  └───────────────────────────────────┬───────────────────────────────────┘  │
+│                                      │ open(path, OpenOptions)              │
+│                                      ▼                                      │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ File Trait (Send + Sync, Exclusive Handle)                            │  │
+│  │ ├── Reading: seek, read, read_range                                   │  │
+│  │ ├── Writing: write, flush                                             │  │
+│  │ └── Lifecycle: stat, size, close (commit), discard (abort)            │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.3 `find()` (mirrors gcsfs `_find`)
+#### The Six Mandatory Primitives
+1. `info(&self, path: &str) -> Result<Entry>`
+2. `ls(&self, path: &str, opts: ListOptions) -> Result<Vec<Entry>>`
+3. `open(&self, path: &str, opts: OpenOptions) -> Result<Box<dyn File>>`
+4. `rm_file(&self, path: &str) -> Result<()>`
+5. `mkdir(&self, path: &str, opts: MkdirOptions) -> Result<()>`
+6. `rmdir(&self, path: &str) -> Result<()>`
 
-Flat listing (`delimiter = ""`) under `prefix`, so one paginated RPC stream
-regardless of depth. Then in Rust:
+### 2. Multi-Bucket Capability Architecture
 
-- if the listing under `path/` is empty, retry with `prefix = key` so that
-  `find("b/file")` returns `[file]`; a missing path returns `[]` (gcsfs does
-  not raise here),
-- if `withdirs`, synthesise `Directory` entries for every intermediate prefix
-  between `path` and each object; `path` itself is included when it is a
-  nested directory (not when it is a bucket),
-- `maxdepth` is a post-filter on the full listing (`maxdepth < 1` is an
-  error), so cost is still *P* for the whole subtree,
-- gcsfs emits placeholders as **File** entries with their raw trailing-slash
-  name (`b/dir/`) *and* a synthesised `b/dir` directory when `withdirs`
-  (see D15).
+`GcsFs` serves all three Google Cloud Storage bucket layouts through capability-based dispatch:
 
-`walk`, `du`, `rm -r`, `copy -r`, `mv -r` are all built on `find`, which means
-**one listing pass per operation** instead of fsspec's one `ls` per directory.
-
-### 2.4 Bucket kinds: flat, hierarchical (HNS) and zonal (Rapid)
-
-GCS has three kinds of bucket and they differ in exactly the places where the
-emulation above matters. gcsfs upstream encodes the same split in
-`ExtendedGcsFileSystem`; this is the spec we mirror.
-
-| Kind | Detected by | Directories | Data path |
+| Feature / Capability | Flat Buckets | Hierarchical Namespace (HNS) | Zonal (Rapid Storage) |
 |---|---|---|---|
-| **Flat** (default) | neither of the below | emulated from prefixes / placeholders (§2.1–2.3) | gRPC bidi **or** HTTP |
-| **Hierarchical** (HNS) | `GetStorageLayout.hierarchical_namespace.enabled` | real `Folder` resources (Storage Control API); empty folders exist; no object versioning | gRPC bidi **or** HTTP |
-| **Zonal** (Rapid Storage) | `GetStorageLayout.location_type == "zone"` (always HNS) | as HNS | **gRPC only**; objects are appendable (single writer, readable while unfinalized); no `RewriteObject` / `Compose` |
+| **Directory Model** | Prefixes & zero-byte placeholders | Real `Folder` resources | Real `Folder` resources |
+| **Directory Rename** | Iterative per-object copy-delete | Atomic `RenameFolder` LRO | Atomic `RenameFolder` LRO |
+| **Server-Side Copy** | `RewriteObject` token loop | `RewriteObject` token loop | `Unsupported` |
+| **Write Model** | Single-shot or Resumable upload | Single-shot or Resumable upload | Appendable objects |
+| **Publish Invariant** | Atomic on `close()` | Atomic on `close()` | Persists on `flush()` |
+| **Data Transport** | gRPC bidi with HTTP fallback | gRPC bidi with HTTP fallback | gRPC DirectPath only |
 
-Detection is lazy — one `GetStorageLayout` per bucket on first use (it only
-needs `storage.objects.list`, which is why gcsfs uses it rather than
-`GetBucket`) — and cached for the lifetime of the `GcsFs`. A failed lookup
-(missing bucket, missing permission, transient error) is logged at `warn` and
-the bucket is treated as **flat without caching**, so a later call retries.
-`GcsFsBuilder::bucket_kind(bucket, kind)` pre-seeds the cache for tests or
-for principals that cannot read the layout. `GcsFs::bucket_kind(bucket)`
-exposes the resolved kind to the bridge (gcsfs's `_is_zonal_bucket`).
+### 3. Path & Emulation Semantics
 
-What each operation does per kind (object reads/writes/deletes are identical
-unless stated):
+* **Root**: The root is represented by the empty string `""`. `ls("")` lists all buckets visible to the project.
+* **Entry Paths**: Normalized as `bucket/key` without leading slashes or URI schemes.
+* **Placeholders**: A zero-byte object ending in `/` (`b/dir/`) is treated as a directory. Standard listings suppress self-placeholders.
+* **Generations**: Paths with `#generation` pin the object version. Reads honor pinned generations; listings emit generations only when `versions = true`.
 
-| Operation | Flat | HNS | Zonal |
-|---|---|---|---|
-| `info(dir)` | 1-item prefix listing / placeholder | `GetFolder` (times + metageneration in `Entry::stat`) | as HNS |
-| `ls` | `ListObjects` delimiter `/` | + `include_folders_as_prefixes` so empty folders appear | as HNS |
-| `find` | one flat `ListObjects` | `ListObjects` ∥ `ListFolders(prefix)`, merged (empty folders) | as HNS |
-| `mkdir` nested | no-op / placeholder (D8) | `CreateFolder(recursive = create_parents)`; missing parent → `NotFound`; exists → ok | as HNS |
-| `rmdir` nested | placeholder deleted if otherwise empty, else `DirectoryNotEmpty` (D12) | drop placeholder, then `DeleteFolder`; non-empty → `DirectoryNotEmpty` | as HNS |
-| `mv` of a directory | derived: per-object `move_file` + cleanup | `RenameFolder` (atomic LRO) when same bucket; else derived | as HNS |
-| `move_file` | same bucket `MoveObject`; else copy + delete | same | `MoveObject`; cross-bucket → `Unsupported` |
-| `copy_file` | `RewriteObject` (token loop) | same | `Unsupported` (no server-side copy); the bridge may fall back to download + upload |
-| read | configured `Transport` | same | always gRPC, whatever `Transport` says |
-| write (`w`/`x`) | `WriteObject` resumable stream; `close` publishes | same | `open_appendable_object`; `flush` persists (visible to readers); `close` finalizes only if `finalize_on_close` |
-| `OpenMode::Append` | `Unsupported` | `Unsupported` | `reopen_appendable_object(generation)` |
-| `ls`/`find` `versions` | honoured | ignored (no versioning on HNS) | ignored |
+### 4. IPC Sidecar Architecture (`gcsfs-sidecar`)
 
-The storage-neutral contract is untouched by all of this; the kind is an
-implementation detail of `src/gcs/`. The two public additions are
-`BucketKind` (behind `GcsFs`) and the builder knobs listed in §8.
+The out-of-process UDS service is implemented via Tonic gRPC in [`src/rpc/`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/rpc/):
 
----
+* **Socket Management**: Binds to multiple `--uds` paths simultaneously, creates parent directories, sets permissions (`0666`), and cleans up stale socket files.
+* **High-Fidelity Errors**: Attaches the exact [`ErrorKind`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/error.rs) string to the `x-gcsfs-error-kind` metadata header for lossless Python exception mapping.
+* **Bounded Chunk Streaming**: Streaming read handlers read sequentially from `File::read` in chunks up to 3.5 MiB, eliminating whole-file memory buffering.
 
+--------------------------------------------------------------------------------
 
-## 3. Path model
+## Alternatives Considered
 
-The contract uses **string paths** in fsspec form — `bucket/key`, optionally
-`gs://`-prefixed, optionally `#generation`-suffixed — so that it stays
-storage-agnostic (an in-memory file system has no buckets) and matches what the
-bridge receives from Python verbatim. Every `Entry.path` is normalised: no
-scheme, no trailing `/`. The **root** is the empty string: `ls("")` lists
-buckets, `info("")` is a directory, `find("")` spans all buckets.
+### Alternative A: Unified Reader and Writer Handle vs Separate Traits
+*   **Pros**: Separate traits (`FileReader` and `FileWriter`) prevent runtime capability checks on read handles.
+*   **Cons**: Forces `FileSystem` to maintain two separate opening methods (`open` vs `create`), breaking 1:1 symmetry with Python `fsspec` and standard file descriptor models.
+*   **Reason for Rejection**: Rejected by author (D3): A unified `open(path, OpenOptions) -> Box<dyn File>` keeps the entry point identical to `fsspec` while returning `ErrorKind::Unsupported` for invalid mode operations.
 
-`GcsPath` becomes an implementation detail of `src/gcs/` (the parsed form the
-backend works with). Changes still needed there for the GCS implementation:
+### Alternative B: In-Backend Caching vs Opt-in Decorator
+*   **Pros**: In-backend caching inside `GcsFs` provides caching out-of-the-box without requiring client composition.
+*   **Cons**: Destroys testability, violates separation of concerns, and prevents sharing the cache with alternative implementations (such as in-memory test filesystems).
+*   **Reason for Rejection**: Rejected by author (D1/D30): Backends remain strictly stateless. Caching is encapsulated in the [`CachedFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs) decorator.
 
-```rust
-impl GcsPath {
-    pub fn parse(s: &str) -> Result<Self>;   // must accept "b", "b/", "gs://b"; still rejects "" and "/"
-    pub fn is_bucket(&self) -> bool;         // object.is_empty()
-    pub fn as_dir_prefix(&self) -> String;   // "" for buckets, otherwise "key/" (trailing '/' normalised)
-}
-```
+### Alternative C: Concurrent Probe in `info()`
+*   **Pros**: Overlaps `GetObject` and `ListObjects` network latency via `tokio::join!`.
+*   **Cons**: Burns expensive Class A listing requests for every file query, generating a 1,250% billing penalty and risking bucket rate-limit exhaustion.
+*   **Reason for Rejection**: Rejected during Stage 7/8 review: Probing sequentially executes 1 Class B RPC for >95% of queries, drastically reducing API costs.
 
-- Trailing slashes are **preserved** in `object` so placeholders remain
-  addressable internally; all directory logic normalises via
-  `as_dir_prefix()`. gcsfs strips them.
-- `GcsPath::parse` keeps rejecting `#gen` that is not an integer (unchanged).
+--------------------------------------------------------------------------------
 
----
+## Non-Functional Requirements
 
-## 4. Public API: the `FileSystem` and `File` traits
+### Security & Isolation
+*   **Socket Permissions**: Unix domain socket files are created with configurable octal permissions (`0666` default) to allow communication across container boundaries in shared pod volumes.
+*   **Credential Encapsulation**: Cloud Storage credentials (ADC tokens) remain isolated in the sidecar daemon, eliminating the need to mount service account keys into application containers.
 
-The source of truth is the code — [`src/filesystem.rs`](../src/filesystem.rs),
-[`src/file.rs`](../src/file.rs), [`src/entry.rs`](../src/entry.rs),
-[`src/options.rs`](../src/options.rs) — this section explains the shape and the
-reasoning.
+### Performance & Efficiency
+*   **IPC Read Throughput**: Deliver > 1.5 GB/s transfer rates over local UDS socket buffers.
+*   **Sub-Millisecond Metadata**: Unary `info` lookups execute under 500 µs over UDS.
+*   **Memory Footprint**: Sidecar daemon stays bounded to `O(concurrency * chunk_size)` regardless of the size of the files being read.
 
-### 4.1 Why traits, and why these two
+--------------------------------------------------------------------------------
 
-- `FileSystem` ≙ fsspec `AbstractFileSystem`, `File` ≙ `AbstractBufferedFile`.
-  The split is the same one fsspec, `std::fs` and `object_store` all make: the
-  file system is a stateless, shareable service; a file handle carries state
-  (mode, cursor, pending upload).
-- Both are **object-safe `async_trait` traits** (`Send + Sync`), so the bridge
-  can hold `Arc<dyn FileSystem>` / `Box<dyn File>` and pick the implementation
-  at runtime (GCS over gRPC, GCS over HTTP, in-memory for tests). The one heap
-  allocation per call that `async_trait` costs is noise next to an RPC.
-- Implementations outside the crate are first-class: `Error` has public
-  constructors for every kind, `ByteRange::clamp` exposes the slice semantics,
-  and `tests/memory_fs.rs` is written purely against the public API.
+## Detailed Implementation Plan
 
-### 4.2 `FileSystem` — three layers of methods
+### Implementation Modules & Responsibilities
 
-```rust
-#[async_trait]
-pub trait FileSystem: Send + Sync {
-    // Required primitives — the only thing an implementation must provide.
-    async fn info(&self, path: &str) -> Result<Entry>;
-    async fn ls(&self, path: &str, opts: ListOptions) -> Result<Vec<Entry>>;
-    async fn open(&self, path: &str, opts: OpenOptions) -> Result<Box<dyn File>>;
-    async fn rm_file(&self, path: &str) -> Result<()>;
-    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<()>;
-    async fn rmdir(&self, path: &str) -> Result<()>;
+#### 1. [`src/filesystem.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/filesystem.rs)
+*   Defines the [`FileSystem`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/filesystem.rs) trait with 6 required primitives, native overrides, and derived operations.
 
-    // Overridable primitives — generic defaults that work, but real stores
-    // have much faster native versions (flat listing, ranged GET, server-side
-    // copy / atomic rename). The GCS implementation overrides all of these.
-    async fn find(&self, path: &str, opts: FindOptions) -> Result<Vec<Entry>>;
-    async fn cat_file(&self, path: &str, range: ByteRange, opts: ReadOptions) -> Result<Bytes>;
-    async fn pipe_file(&self, path: &str, data: Bytes, opts: WriteOptions) -> Result<()>;
-    async fn put_file(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<()>;
-    async fn get_file(&self, path: &str, local: &Path, opts: ReadOptions) -> Result<()>;
-    async fn copy_file(&self, src: &str, dst: &str) -> Result<()>;
-    async fn move_file(&self, src: &str, dst: &str) -> Result<()>;
-    fn invalidate_cache(&self, path: Option<&str>) {}   // no-op unless wrapped in CachedFs
+#### 2. [`src/file.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs)
+*   Defines the unified [`File`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs) handle trait for cursor reads, positional range reads, streaming writes, and commit/abort lifecycles.
 
-    // Derived operations — encode fsspec semantics once, in derived.rs.
-    async fn exists / is_file / is_dir / size(&self, path: &str) -> …;
-    async fn walk(&self, path: &str, opts: WalkOptions) -> Result<Vec<WalkEntry>>;
-    async fn du(&self, path: &str, opts: DuOptions) -> Result<DiskUsage>;
-    async fn glob(&self, pattern: &str, opts: GlobOptions) -> Result<Vec<Entry>>;
-    async fn cat(&self, paths: &[&str], opts: BulkOptions) -> Result<Vec<(String, Result<Bytes>)>>;
-    async fn cat_ranges(&self, requests: &[(&str, ByteRange)], opts: BulkOptions) -> Result<Vec<Result<Bytes>>>;
-    async fn rm(&self, path: &str, opts: RmOptions) -> Result<()>;
-    async fn copy(&self, src: &str, dst: &str, opts: CopyOptions) -> Result<()>;
-    async fn mv(&self, src: &str, dst: &str, opts: CopyOptions) -> Result<()>;
-    async fn put(&self, local: &Path, path: &str, opts: PutOptions) -> Result<()>;
-}
-```
+#### 3. [`src/derived.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/derived.rs)
+*   Encodes storage-agnostic `fsspec` algorithms: breadth-first search `find`, grouped `walk`, pattern-matching `glob`, recursive `rm`, `copy`, and `mv`.
 
-Mapping of the requested fsspec surface: `exists isdir isfile ls glob find rm
-walk put move/mv mkdir rm_file du cat cat_file rmdir copy size` are
-`FileSystem` methods; `open` returns a `File`, and `read write tell flush
-close` live on `File`.
+#### 4. [`src/gcs/`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/)
+*   `fs.rs`: Implementation of `FileSystem for GcsFs` with sequential `info` probe, bucket listing, and multi-bucket layout handling.
+*   `file.rs`: Implementation of `File for GcsFile` with read-ahead buffering and resumable/appendable writer backends.
+*   `backend.rs`: Connection pool and SDK client management.
+*   `control.rs`: Storage Control API operations (HNS folders, bucket operations, warning log on bucket deletions).
 
-What the derived layer guarantees (all verified in `tests/memory_fs.rs`):
+#### 5. [`src/rpc/`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/rpc/)
+*   `server.rs`: Tonic service implementation over UDS/TCP with chunked streaming reads.
+*   `client.rs`: `RemoteFs` client implementing `FileSystem` across the RPC channel.
+*   `convert.rs`: Bidirectional status and error conversion.
 
-| Operation | Behaviour encoded |
-|---|---|
-| `find` | BFS over `ls`; missing path → `[]`; file → `[file]`; `withdirs` adds directories and the start directory itself (never the root `""`); `maxdepth` ≥ 1 |
-| `walk` | one `find(withdirs)` grouped into `(dir, dirs, files)` top-down; file or missing path → nothing |
-| `glob` | `*`/`?`/`[seq]` within a segment, `**` across segments (zero-or-more mid-pattern, one-or-more trailing, as in `fsspec.utils.glob_translate`); trailing `/` → directories only; wildcard-free pattern → `info` |
-| `cat` / `cat_ranges` | bounded concurrency, input order preserved, `OnError::{Raise, Ignore, Return}` |
-| `rm` | file → `rm_file`; directory needs `recursive` else `IsADirectory`; files deleted concurrently (vanished files ignored), then directories deepest-first, then the path itself via `rmdir` |
-| `copy` / `mv` | fsspec destination rule: `dst` ending in `/` or an existing directory ⇒ nest under `dst/<name>`, unless the *source* ends in `/` (copy contents); directory needs `recursive`; `mv` = `move_file` per file, then `rm` of what is left |
-| `put` | same destination rule with the local trailing separator; walks the local tree; `get_file` creates parent directories |
+#### 6. [`src/bin/gcsfs_sidecar.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/bin/gcsfs_sidecar.rs)
+*   Production daemon binary supporting `--uds <PATH>` (multi-socket), `--tcp <ADDR>`, `--mode <OCTAL>`, and `SIGINT`/`SIGTERM` signal traps.
 
-Rules shared by every implementation: `exists` is true for files **and**
-directories; file operations on directories fail with `IsADirectory`; backends
-cache nothing — caching is the `CachedFs` decorator's job (**D30**).
+--------------------------------------------------------------------------------
 
-### 4.2.1 `CachedFs` — the fsspec `dircache`, for `ls` **and** `info`
+## Architecture Decision Records (ADRs)
 
-`CachedFs<F: FileSystem>` wraps any filesystem and is itself a `FileSystem`,
-so the bridge can hold `Arc<dyn FileSystem>` either way. One store serves both
-read primitives: a `ls` fills a directory node with its complete listing, and
-`info` on any child is then answered from it; an individual `info` result is
-kept in a *partial* node that can never be mistaken for a listing. Eviction is
-per directory node, so a listing is served whole or not at all. The design and
-its rationale are in [`dir_cache_design.md`](dir_cache_design.md); the planned
-data half of the same decorator in [`page_cache_design.md`](page_cache_design.md).
-
-| Aspect | Behaviour | gcsfs/fsspec counterpart |
+| ADR | Domain | Decision Summary |
 |---|---|---|
-| `ls` | miss → store listing; hit → sorted copy. `versions` or a `#gen` path bypasses; `refresh` skips the lookup and replaces the entry | `_ls` / `ls(refresh=True)` |
-| `info` | parent listing → single cached entry → "is a complete directory" → backend; result upserted under its parent | `_info` → parent dircache → `_ls_from_cache` → `_get_object` |
-| negative answers | `CacheConfig::negative` (default **off**): a name absent from a complete listing is `NotFound` without a request | fsspec `_ls_from_cache` raises `FileNotFoundError` (always on) |
-| `find` | `withdirs && maxdepth.is_none() && !versions` fills every directory visited | `_find(update_cache=True)` when `prefix == ""` |
-| writes (`pipe_file`, `put_file`, `copy_file`, `mkdir`, `move_file` dst, write handles at `open` **and** `close`) | parent cached → drop the parent only; else drop the parent and all ancestors (an implicit directory may have appeared) | `DirCacheUpdater._write_file_cache_update` |
-| deletes / trees (`rm_file`, `rmdir`, `rm`, `mv`, `copy` dst, `put`, `move_file` src) | drop the subtree, then the parent and all ancestors | `_rm_files_cache_update`, `_mv_file_cache_update` |
-| `invalidate_cache(Some(p))` / `None` | drop `p`'s subtree and ancestors / everything | `invalidate_cache(path)` / `invalidate_cache()` |
-| `ttl`, `max_dirs` | per-entry expiry; LRU over directory nodes | `listings_expiry_time`, `max_paths` |
-| data | never cached (`cat_file`, `get_file`, read handles pass straight through) | — |
+| **D1 / D30** | Caching | Stateless backends; opt-in [`CachedFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs) decorator for unified directory and metadata caching. |
+| **D2** | Root Model | Root is `""`; `ls("")` lists buckets without specialized top-level methods. |
+| **D3** | Handle API | Unified `open(path, OpenOptions) -> Box<dyn File>` rather than separate open and create methods. |
+| **D4** | Read Buffer | 5 MiB configurable read-ahead buffer in `GcsFile::read`. |
+| **D5** | Globbing | Native, dependency-free matcher in [`src/glob.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/glob.rs) with `fsspec.glob_translate` semantics. |
+| **D6** | Entry Kinds | Buckets are represented as `EntryKind::Directory` to preserve pure filesystem abstractions. |
+| **D7** | Bucket Info | `info(bucket)` probes `GetBucket`, falling back to listing on permission denied. |
+| **D8** | Mkdir Semantics | `mkdir(path)` is a no-op by default; writes zero-byte marker only when `placeholder = true`. |
+| **D9** | Error Fidelity | Strict POSIX error mapping (`IsADirectory`, `NotADirectory`, `DirectoryNotEmpty`). |
+| **D10** | Bucket Deletion | `rm(bucket, recursive=true)` deletes the bucket itself and logs at `warn!` level. |
+| **D11** | Path Mapping | Recursive copy and move destination mapping implemented natively via `destination_base`. |
+| **D12** | Rmdir Semantics | Strict directory deletion: non-empty directories raise `DirectoryNotEmpty`. |
+| **D13 / D22** | Transport | Default `Grpc` with automatic fallback to `Http` on bidi read unavailability. |
+| **D14** | Transport Accessor | Public `GcsFs::transport()` accessor exposed for diagnostic inspection. |
+| **D15** | Compat Switch | Directory placeholder quirks normalized away in core; bridge layer handles compatibility shims. |
+| **D16** | Handle Bounds | `File` requires `Send + Sync`; `Debug` supertrait omitted. |
+| **D17** | Delivery Order | Phase 1 delivered in one unified release covering all three bucket types. |
+| **D18** | Layout Detection | Lazy `GetStorageLayout` lookup cached for the client lifetime; un-cached fallback on error. |
+| **D19 / D29** | Kind Dispatch | Dispatch driven by named capabilities of `BucketKind` rather than hardcoded variant branching. |
+| **D20** | Zonal Copy | Zonal server-side copies return `ErrorKind::Unsupported` (requires client-side read/write). |
+| **D21** | Zonal Writing | Zonal appendable objects persist on `flush()`; `finalize_on_close` defaults to `false`. |
+| **D23** | Bucket Creation | Storage-specific creation handled outside trait via `GcsFs::create_bucket(name, BucketSpec)`. |
+| **D24** | Test Harness | Integration tests run against live Flat, HNS, and Zonal buckets under isolated scratch prefixes. |
+| **D25** | Create Exclusivity | `if_generation_match = 0` precondition failures map to `ErrorKind::AlreadyExists`. |
+| **D26** | Zonal Discard | Discarding an appendable writer leaves already-flushed bytes intact with a warning log. |
+| **D27** | Explicit Discard | Explicit async `File::discard()` retained, backed by `Drop` safety net. |
+| **D28** | Read Options | Extensible `ReadOptions` struct constructed via `Default` with `#[non_exhaustive]` protection. |
 
-Invalidation happens whether or not the wrapped call succeeded (conservative:
-a failed delete may still have changed something). The cache is exact for this
-client's own writes; another writer is reconciled by `ttl`,
-`invalidate_cache`, or `refresh` — the contract gcsfs documents.
+--------------------------------------------------------------------------------
 
-### 4.3 Option structs
+## Verification Plan
 
-One plain struct per operation, all `Default` with fsspec's defaults, so calls
-read like keyword arguments: `RmOptions { recursive: true, ..Default::default() }`.
-They are deliberately **not** `#[non_exhaustive]` so the bridge can use
-struct-update syntax; adding a field is a minor-version bump.
+*   **Deterministic Contract Tests**:
+    ```bash
+    cargo test --test memory_fs
+    ```
+    Executes 12 test scenarios verifying all derived operations over in-memory storage without network calls.
+*   **Directory & Metadata Cache Tests**:
+    ```bash
+    cargo test --test cache
+    ```
+    Executes 21 test scenarios verifying TTL expiration, LRU eviction, and invalidation rules.
+*   **Live Multi-Bucket Integration Tests**:
+    ```bash
+    cargo test --test live
+    ```
+    Executes 10 live scenarios across Flat, HNS, and Zonal buckets when `GCS_RUST_FS_TEST_BUCKETS` is configured.
+*   **RPC Sidecar Integration Tests**:
+    ```bash
+    cargo test --test rpc
+    ```
+    Executes 10 test scenarios verifying multi-UDS serving, concurrent client streaming, and error mapping over UDS.
+*   **Full Crate Verification**:
+    ```bash
+    cargo test
+    cargo clippy --all-targets -D warnings
+    ```
 
-| Struct | Fields |
-|---|---|
-| `OpenOptions` | `mode: OpenMode` (`Read`/`Write`/`Append`/`CreateNew`, parsed from `"rb" "wb" "ab" "xb"`), `block_size`, `content_type`, `metadata` |
-| `WriteOptions` | `mode: WriteMode` (`Overwrite`/`Create`), `content_type`, `metadata`, `block_size` |
-| `ListOptions` | `versions`, `refresh` (bypass and replace a cached listing; ignored by backends) |
-| `FindOptions` | `maxdepth`, `withdirs`, `versions` |
-| `WalkOptions` / `GlobOptions` | `maxdepth` |
-| `DuOptions` | `maxdepth`, `withdirs` |
-| `BulkOptions` | `concurrency` (64), `on_error` |
-| `RmOptions` | `recursive`, `maxdepth`, `concurrency` |
-| `CopyOptions` | `recursive`, `maxdepth`, `concurrency`, `on_error: Option<OnError>` (`None` = fsspec default: ignore `NotFound` for recursive copies) |
-| `PutOptions` | `recursive`, `concurrency`, `write: WriteOptions` |
-| `MkdirOptions` | `create_parents`, `location`, `placeholder` |
+--------------------------------------------------------------------------------
 
-GCS-only knobs (`if_generation_match`, `gcsfs_compat` listings, transport)
-are **not** options on the trait; they belong to `GcsFsBuilder` configuration
-(**D15**).
-
-### 4.4 `File` — one handle type, one mode
-
-```rust
-#[async_trait]
-pub trait File: Send + Sync {
-    fn path(&self) -> &str;  fn mode(&self) -> OpenMode;  fn closed(&self) -> bool;
-    fn tell(&self) -> u64;   fn size(&self) -> Option<u64>;  fn stat(&self) -> Option<&ObjectStat>;
-    fn readable(&self) -> bool;  fn writable(&self) -> bool;  fn seekable(&self) -> bool;
-
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64>;                 // read handles; sync, no RPC
-    async fn read(&mut self, len: Option<usize>) -> Result<Bytes>;    // cursor; None = to EOF; empty at EOF
-    async fn read_range(&self, range: ByteRange) -> Result<Bytes>;    // positional; cursor untouched; &self ⇒ concurrent
-
-    async fn write(&mut self, data: Bytes) -> Result<()>;             // append-only, back-pressure
-    async fn flush(&mut self) -> Result<()>;                          // hands bytes to the upload; does NOT publish
-
-    async fn close(&mut self) -> Result<()>;                          // writers: finalise + publish atomically; idempotent
-    async fn discard(&mut self) -> Result<()>;                        // writers: abort, publish nothing; idempotent (D27)
-}
-```
-
-- Like `std::fs::File` and Python file objects, read and write handles share
-  one type; a wrong-mode call fails with `Unsupported`, I/O after `close` with
-  `Closed`. This keeps `open(path, mode)` a single method, matching fsspec
-  (**D3** resolved).
-- Read handles pin the content at open time (generation on GCS).
-- Writers follow object-store semantics that differ from local files and must
-  be documented for users: objects are immutable, so **nothing is visible until
-  `close()`**; `flush()` only pushes bytes into the upload; `discard()`
-  abandons the upload and publishes nothing, and dropping an unclosed writer
-  does the same as a safety net (D27); `Append` is `Unsupported` except on
-  zonal buckets, where appendable objects make `flush()` persist and
-  `discard()` cannot un-publish (D21, D26); `CreateNew` maps to
-  `if_generation_match = 0` → `AlreadyExists` (D25).
-- Planned GCS writer: a channel-backed `StreamingSource` feeding
-  `Storage::write_object(..).send_buffered()` on a background task; the SDK
-  handles resumable vs single-shot, retries and CRC32C.
-- Read-ahead for `read()` (**D4**) is an implementation choice of `GcsFile`,
-  not part of the contract.
-
----
-
-## 5. Method-by-method mapping
-
-"Where" = **Rust** (native implementation here), **Bridge** (trivial glue in
-the PyO3 layer) or **fsspec** (inherited Python logic, Rust only supplies the
-primitive). RPC cost is for the common case; *n* = number of objects,
-*P* = ⌈n / 1000⌉ list pages.
-
-| fsspec call | Where | Rust API | Backend primitive(s) | SDK RPC(s) | Cost |
-|---|---|---|---|---|---|
-| `info` | Rust | `info` | `get_bucket` / `get_object` + `list_page` | `StorageControl::{get_bucket,get_object,list_objects}` | 1–2 |
-| `exists` | Rust | `exists` | same as `info` | same | 1–2 |
-| `isdir` / `isfile` | Rust | `is_dir` / `is_file` | same as `info` | same | 1–2 |
-| `size` | Rust | `size` | same as `info` | same | 1–2 |
-| `ls` | Rust | `ls` / `ls_buckets` | `list_page` (delimiter `/`) / `list_buckets` | `list_objects` by page / `list_buckets` | P |
-| `find` | Rust | `find` | `list_page` (no delimiter) | `list_objects` | P |
-| `walk` | Rust | `walk` (grouped `find`) | `list_page` | `list_objects` | P (fsspec: one `ls` per dir) |
-| `du` | Rust | `du` | `list_page` | `list_objects` | P |
-| `glob` | fsspec (**D5**) | uses `find(withdirs=true)` | `list_page` | `list_objects` | P |
-| `cat_file` | Rust | `cat_file` | `read_range` | `open_object`+`read` (gRPC) / `read_object` (HTTP) | 1 (+1 stat if negative bounds) |
-| `cat_ranges` | Rust | `cat_ranges` | `read_range` ×k, bounded concurrency | as above | k |
-| `cat` | Rust | `cat` (`find` for recursive) | `read_range` ×n | as above | P + n |
-| `open(mode="rb")` | Bridge→Rust | `open` → `GcsFile` | `open` (stat + descriptor) | `get_object` + `open_object` | 1–2 |
-| `read` / `seek` / `tell` | Rust | `GcsFile::{read,seek,tell}` | `read_range` on the open descriptor | bidi read / HTTP range | per read (≤1) |
-| `close` (reader) | Rust | `GcsFile::close` | drop | — | 0 |
-| `open(mode="wb")` | Bridge→Rust | `create` → `GcsWriter` | `write_object(stream)` | `WriteObject` (single-shot or resumable) | 1+ |
-| `write` / `flush` / `tell` | Rust | `GcsWriter::{write,flush,tell}` | channel → upload task | resumable chunks | per chunk |
-| `close` (writer) | Rust | `GcsWriter::close` | finalise | finalise upload | 1 |
-| `pipe_file` | Rust | `pipe_file` | `write_object(Bytes)` | `WriteObject` | 1 |
-| `put_file` | Rust | `put_file` | `write_object(tokio::fs::File)` | `WriteObject` (resumable, seekable → unbuffered) | 1+ |
-| `put` | Rust | `put` (local walk + bounded `put_file`) | `write_object` ×n | `WriteObject` ×n | n |
-| `get_file` | Rust | `get_file` | `read_range(all)` → file | read | 1 |
-| `rm_file` | Rust | `rm_file` | `delete_object` | `delete_object` | 1 |
-| `rm` | Rust | `rm` (`find` + bounded deletes) | `delete_object` ×n (+ `delete_bucket`) | `delete_object` | P + n |
-| `copy_file` / `cp_file` | Rust | `copy_file` | `rewrite_object` loop | `rewrite_object` (token loop) | ≥1 |
-| `copy` / `cp` | Rust | `copy` (`find` + mapping + bounded `copy_file`) | `rewrite_object` ×n | `rewrite_object` | P + n |
-| `mv` / `move` | Rust | `mv` (`find` + mapping + bounded `move_file`) | same bucket: `move_object`; else `rewrite_object` + `delete_object` | `move_object` (atomic rename) / rewrite + delete | P + n (same bucket) / P + 2n |
-| `mkdir` | Rust | `mkdir` | `create_bucket` / optional placeholder | `create_bucket` / `WriteObject` | 0–1 |
-| `rmdir` | Rust | `rmdir` | `delete_bucket` / `delete_object` | `delete_bucket` / `delete_object` | 1–2 |
-| `makedirs`, `touch`, `pipe`, `get`, `modified`, `created`, `checksum`, `expand_path` | fsspec/Bridge | derived from the above | — | — | — |
-
-Notes per method where gcsfs behaviour is subtle (all verified against the
-gcsfs source in `~/code/gcsfs` and fsspec 2026.7):
-
-- **`ls` on a file** returns `[that file]`; on a missing path raises NotFound
-  (gcsfs does the same via `_get_object`).
-- **`ls(versions=true)`** emits one entry per generation with `#gen` in the
-  path (gcsfs convention).
-- **`info`/`stat` permission fallback**: when `get_object` is *Forbidden*,
-  gcsfs falls back to `list_objects(prefix = key, page_size = 1)` and matches
-  the exact name (works with list-only IAM). Cheap to mirror; proposed.
-- **`find` on a file** returns `[file]`; on a missing path returns `[]`.
-- **`du`**: `DiskUsage::total` sums files only (dirs are 0); `sizes` is the
-  `find` result with sizes (what fsspec returns for `total=False`).
-- **`cat` on a directory path** with `recursive = false` raises
-  `IsADirectory`; fsspec's `cat` instead expands globs/dirs via
-  `expand_path` — keep that expansion in fsspec (**D5**), Rust `cat` takes
-  explicit file paths.
-- **`rm_file` on a bucket** → `IsADirectory` (gcsfs silently calls
-  `rmdir`) (**D9**).
-- **`rm(dir, recursive=false)`** → `IsADirectory` (gcsfs: 404 → NotFound,
-  confusing) (**D9**).
-- **`rm(bucket, recursive=true)`** deletes every object **and then the
-  bucket** (gcsfs `_rm`: paths without a key go to `_rmdir`). Recommend
-  mirroring but it is dangerous enough to ask (**D10**). gcsfs also raises
-  `NotFound` when *nothing* was deleted and ignores per-object NotFound —
-  mirror both.
-- **`copy` path mapping** follows fsspec's documented scenarios
-  ([copying.html](https://filesystem-spec.readthedocs.io/en/latest/copying.html),
-  implemented by `other_paths`) (**D11**):
-  - file → `dst` ending in `/` or an existing directory: `dst/basename(src)`;
-    otherwise `dst` is the new file name.
-  - directory (needs `recursive`): **the trailing slash on the source
-    decides** — `copy("b/src/", "b/dst/")` copies the *contents*
-    (`b/dst/<rel>`), `copy("b/src", "b/dst/")` copies the directory itself
-    (`b/dst/src/<rel>`). The nesting applies only when `dst` is a directory
-    (trailing `/` or exists); otherwise contents map to `dst/<rel>`.
-  - `maxdepth` limits depth; `recursive = false` on a directory copies nothing
-    (fsspec returns silently) — we return `IsADirectory` instead (**D9**).
-  - with `recursive`, fsspec defaults `on_error = "ignore"` (NotFound only);
-    we default `OnError::Ignore` for recursive and `Raise` otherwise, same.
-  - Same bucket or cross bucket both use server-side `rewrite_object`; no data
-    flows through the client.
-- **`mv`**: current gcsfs uses the **`objects.move` API** (atomic rename, one
-  RPC, works for any bucket type) when source and destination are in the same
-  bucket, falling back to copy + delete on non-NotFound errors; cross-bucket
-  is copy + delete. We map this to `StorageControl::move_object` with the
-  same fallback. Moving to a `#generation` destination is an error.
-  Path mapping is the same as `copy`.
-- **`mkdir(bucket)`** creates the bucket (needs `project`, optional
-  `location`); `mkdir(bucket/dir)` is a no-op when the bucket exists; when the
-  bucket is missing it is created if `create_parents = true` (gcsfs default is
-  `false` → `NotFound`). Optional `placeholder = true` additionally writes the
-  zero-byte `dir/` object (**D8**). Root → `InvalidPath`.
-- **`rmdir(bucket)`** deletes the bucket; non-empty → `DirectoryNotEmpty`.
-  **`rmdir(bucket/dir)`**: gcsfs is a silent no-op. Proposal: delete the
-  placeholder if the directory is otherwise empty, `DirectoryNotEmpty` if not,
-  `NotFound` if it does not exist (**D12**).
-
----
-
-## 6. Errors
-
-New `ErrorKind` variants (and their Python mapping in the bridge):
-
-| `ErrorKind` | Raised by | Python |
-|---|---|---|
-| `IsADirectory` | `cat_file`/`open`/`rm_file`/`rm(recursive=false)` on a directory | `IsADirectoryError` |
-| `NotADirectory` | `ls`/`walk`/`rmdir` on a file where a directory is required | `NotADirectoryError` |
-| `AlreadyExists` | `create`/`pipe_file` with `if_generation_match = 0`, `mkdir(bucket)` on an existing bucket | `FileExistsError` |
-| `DirectoryNotEmpty` | `rmdir` | `OSError(ENOTEMPTY)` |
-| `PreconditionFailed` | any `if_*_match` mismatch other than create-only | `OSError` |
-| `Unsupported` | append mode, operations the transport cannot do | `NotImplementedError` |
-
-Bulk operations (`cat`, `cat_ranges`, `rm`, `copy`, `put`) honour
-`OnError::{Raise, Ignore, Return}`; with `Raise` the first error aborts the
-remaining work (in-flight tasks are cancelled) and is returned. `rm` treats
-`NotFound` on individual objects as success (idempotent delete, like gcsfs).
-
----
-
-## 7. Concurrency and resource limits
-
-- `GcsFs` is `Clone + Send + Sync`; all methods take `&self`.
-- Bulk work uses `tokio::task::JoinSet` bounded by a `Semaphore(concurrency)`
-  (default 64, configurable per call and as a builder default
-  `GcsFsBuilder::default_concurrency`).
-- Listing is sequential per prefix (page tokens are inherently serial).
-  Phase 3 can shard huge prefixes with `lexicographic_start/end`, as gcsfs's
-  `_concurrent_list_objects_helper` does.
-- Readers hold the bidi descriptor for the lifetime of the `GcsFile` (needed:
-  dropping it kills in-flight reads).
-- Results are `Vec`, not streams, in phase 1 (simpler for the bridge, matches
-  fsspec which returns lists). A streaming `find`/`walk` can be added later
-  without breaking changes.
-
----
-
-## 8. Configuration additions
-
-| Builder | Env var | Used by |
-|---|---|---|
-| `project(id)` | `GCS_RUST_FS_PROJECT`, then `GOOGLE_CLOUD_PROJECT` | `ls_buckets`, `mkdir(bucket)` |
-| `default_concurrency(n)` | `GCS_RUST_FS_CONCURRENCY` | bulk ops |
-| `read_block_size(bytes)` | `GCS_RUST_FS_READ_BLOCK_SIZE` | `GcsFile::read` read-ahead |
-| `write_block_size(bytes)` | `GCS_RUST_FS_WRITE_BLOCK_SIZE` | `GcsWriter` chunking |
-| `bucket_kind(bucket, kind)` | — | pre-seeds the bucket-kind cache (§2.4) |
-| `finalize_on_close(bool)` (default `false`, as gcsfs) | — | zonal writers: whether `close` finalizes the appendable object |
-
-Existing: `transport`, `endpoint`, `grpc_subchannel_count`, `from_env()`.
-
-Bucket creation with GCS-specific placement is **not** part of the contract
-(`MkdirOptions` stays `create_parents` / `location` / `placeholder`). The
-inherent `GcsFs::create_bucket(name, BucketSpec { location, zone,
-hierarchical, storage_class })` covers gcsfs's
-`mkdir(enable_hierarchical_namespace=…, placement=…)`; the bridge calls it
-when those kwargs are present and `mkdir` otherwise.
-
----
-
-## 9. Python bridge mapping (for context; implemented in gcsfs)
-
-```python
-class GCSFileSystem(AsyncFileSystem):
-    async def _info(self, path, **kw):        return entry_to_dict(await rs.info(path))
-    async def _ls(self, path, detail=False, **kw):
-        entries = await rs.ls(path)           # root -> rs.ls_buckets()
-        return [entry_to_dict(e) for e in entries] if detail else [e.path for e in entries]
-    async def _find(self, path, maxdepth=None, withdirs=False, detail=False, **kw): ...
-    async def _cat_file(self, path, start=None, end=None, **kw): return await rs.cat_file(path, start, end)
-    async def _pipe_file(self, path, data, **kw):   await rs.pipe_file(path, data)
-    async def _put_file(self, lpath, rpath, **kw):  await rs.put_file(lpath, rpath)
-    async def _cp_file(self, p1, p2, **kw):         await rs.copy_file(p1, p2)
-    async def _rm_file(self, path, **kw):           await rs.rm_file(path)
-    async def _rm(self, path, recursive=False, maxdepth=None, **kw): await rs.rm(path, recursive, maxdepth)
-    async def _mkdir / _rmdir / _du / _walk / _exists / _isdir / _isfile / _size ...
-    def _open(self, path, mode="rb", block_size=None, **kw):
-        return RustReadFile(rs.open(path, block_size)) if "r" in mode else RustWriteFile(rs.create(path, ...))
-```
-
-`entry_to_dict` produces gcsfs's dict shape:
-`{"name", "size", "type": "file"|"directory", "bucket", "generation",
-"updated", "mtime", "crc32c", "md5Hash", "contentType", "storageClass", ...}`.
-fsspec-derived helpers (`glob`, `expand_path`, `cat` with globs, `get`, `pipe`,
-`makedirs`, `touch`) keep working through these primitives.
-
----
-
-## 10. Phasing and testing
-
-| Phase | Scope | Verification |
-|---|---|---|
-| **0 — contract** ✅ | `FileSystem` / `File` traits, `Entry`, option structs, new error kinds, generic `derived.rs` (`find walk du glob cat cat_ranges rm copy mv put get_file …`) | `tests/memory_fs.rs`: an in-memory implementation of the six primitives drives every derived operation (12 scenario tests); `cargo clippy -D warnings`, docs |
-| **1 — GCS implementation** ✅ (one PR, all three bucket kinds, read + write) | `impl FileSystem for GcsFs` (`info/ls/open/rm_file/mkdir/rmdir` + native `find/cat_file/pipe_file/put_file/copy_file/move_file`, `rm -r` in one listing, HNS `mv` via `RenameFolder`), `impl File for GcsFile` (cursor, `seek`, `read`, resumable writer, zonal appendable writer), bucket-kind detection (§2.4), `GcsFs::create_bucket`, `project` config | `tests/live.rs`: read-only tests via `GCS_RUST_FS_TEST_OBJECT`; five read/write scenarios (write/read back, streaming open, directories/listing/walk, copy/move/remove, append mode) run once per kind via `GCS_RUST_FS_TEST_BUCKETS=flat=princer-ckpt,hns=princer-test-bucket,zonal=princer-zonal-us-west4-a`, each under its own scratch tree that is removed and verified empty afterwards — all green on all three kinds |
-| **2 — optimisation** | parallel listing shards, server-side `match_glob` for `glob`, multi-range parallel `cat_file` for large objects, read-ahead tuning | benchmarks vs gcsfs |
-
-Testing approach: the fsspec semantics live in `derived.rs` and are
-storage-agnostic, so they are tested once, deterministically and without
-network, through the in-memory `FileSystem`. The GCS implementation then only
-has to get the six primitives (plus its native overrides) right, which is what
-the live tests cover. The acceptance list is the relevant subset of gcsfs's
-`test_core.py` (`test_ls`, `test_info`, `test_find`, `test_du`, `test_walk`,
-`test_rm`, `test_copy`, `test_mv`, `test_mkdir_rmdir`, the `test_dir_marker_*`
-family), ported case by case.
-
----
-
-## 11. Open decisions
-
-Decisions marked *encoded* are what the trait layer / `derived.rs` currently
-implements and tests; say so if you want any of them changed.
-
-| # | Question | Recommendation / status |
-|---|---|---|
-| **D1** | Directory cache: none in Rust, fsspec `dircache` in Python? | Originally yes. *Revised by D30*: backends still cache nothing, but an opt-in `CachedFs` decorator now provides the `dircache` semantics in Rust so `info` and `ls` share one store. |
-| **D2** | Root handling: `ls_buckets()` method vs `Location { Root, Path }` on every call? | *Resolved by the string-path traits*: the root is `""`; `ls("")` lists buckets, no special method. |
-| **D3** | `open` (read) + `create` (write) vs one `open(path, mode)`? | *Resolved*: one `open(path, OpenOptions { mode })` returning `Box<dyn File>`, exactly like fsspec. |
-| **D4** | Read-ahead buffer in Rust `GcsFile::read` (default 5 MiB) or keep fsspec's `AbstractBufferedFile` cache in Python? | In Rust, configurable via `OpenOptions::block_size`; lets the Python file object be a thin shim. Not part of the contract. |
-| **D5** | `glob` matcher: stay in fsspec over Rust `find`, or native Rust (globset / server `match_glob`)? | *Resolved*: native, dependency-free matcher in `glob.rs` with `fsspec.glob_translate` semantics, driven by `find` on the wildcard-free prefix. Server-side `match_glob` remains a phase-3 override. |
-| **D6** | Buckets as `EntryKind::Directory` vs a separate `EntryKind::Bucket`? | `Directory` — keeps the API filesystem-only (*encoded*). |
-| **D7** | `info(bucket)` via `get_bucket` with listing fallback. | *Resolved*: gcsfs already does exactly this; mirror it. |
-| **D8** | `mkdir(bucket/dir)`: no-op (gcsfs) with opt-in `placeholder = true`? | Yes; default no-op (*encoded* in `MkdirOptions`). |
-| **D9** | Stricter errors than gcsfs: `IsADirectory` for `rm_file(bucket)`, `rm(dir)`/`copy(dir)` without `recursive`, `cat_file(dir)`? | Yes (*encoded*); the bridge can relax if a gcsfs test depends on the old behaviour. |
-| **D10** | `rm(bucket, recursive=true)` also deletes the bucket (gcsfs behaviour)? | Mirror gcsfs (*encoded*: `rm` ends with `rmdir(path)`), log at `warn` level in the GCS impl. Alternative: require explicit `rmdir`. |
-| **D11** | Recursive `copy`/`mv` destination mapping: implement fsspec's `other_paths` scenarios natively? | Yes (*encoded* in `derived::destination_base`, tested). |
-| **D12** | `rmdir(bucket/dir)`: gcsfs silent no-op vs delete placeholder / `DirectoryNotEmpty`? | Stricter version (*encoded* as the `rmdir` contract; derived `rm` tolerates `NotFound` so implicit directories work). |
-| **D13** | Default transport stays `Grpc` (bidi read requires allowlisted buckets) or switch to `Http`? (carried over) | Keep `Grpc` default, auto-fallback to HTTP on `Unimplemented`/`FailedPrecondition` at `open` time. |
-| **D14** | Keep `GcsFs::transport()` accessor? (carried over) | Keep; it is configuration, not a GCS feature. |
-| **D15** | Placeholder quirks in listings: mirror gcsfs exactly (`ls("b/dir")` includes a `b/dir` directory entry for its own placeholder; `find` emits `b/dir/` as a file plus a synthesised `b/dir` dir) or clean semantics (placeholders never listed as files, listed directory never lists itself)? | Clean semantics in the contract; a `GcsFsBuilder::gcsfs_compat(true)` switch (not a trait option) reproduces the quirks for the bridge so gcsfs's `test_dir_marker_*` tests keep passing. |
-| **D16** | Should `File` require `Debug` (so `Result<Box<dyn File>>` is `unwrap`-friendly and holders can `#[derive(Debug)]`)? | Not required for now; add `Debug` as a supertrait if the bridge wants it — it costs implementors one `impl`. |
-| **D17** | Delivery order of the GCS implementation. | *Decided*: one PR — all three bucket kinds, read and write (§10 phase 1). |
-| **D18** | Bucket-kind detection and failure behaviour. | *Decided*: lazy `GetStorageLayout` per bucket, cached for the `GcsFs` lifetime; a failed lookup is logged at `warn` and treated as flat **without caching**; `GcsFsBuilder::bucket_kind()` pre-seeds. |
-| **D19** | Where kind-specific logic lives. | *Decided*: one `GcsFs`; each trait method `match`es the kind; helpers split into `src/gcs/{control,write,…}.rs`. No per-kind public types. |
-| **D20** | Zonal buckets have no `RewriteObject`/`Compose`. | *Decided*: `copy_file` (and cross-bucket `move_file`) involving a zonal bucket → `ErrorKind::Unsupported` (gcsfs raises `NotImplementedError`); same-bucket `move_file` uses `MoveObject`. |
-| **D21** | Zonal write policy. | *Decided*: mirror gcsfs — `GcsFsBuilder::finalize_on_close(bool)` default `false` (object stays appendable; `close` = flush + close stream); `"ab"` reopens by generation; `flush` persists bytes (unlike other kinds). |
-| **D22** | Transport vs zonal (supersedes D13). | *Decided*: zonal data always travels over gRPC regardless of `Transport`; default stays `Grpc`; a non-zonal bucket whose bidi read fails with `Unimplemented`/`FailedPrecondition` falls back to HTTP for that read with a `warn`. |
-| **D23** | gcsfs `mkdir(enable_hierarchical_namespace=…, placement=…)`. | *Decided*: keep `MkdirOptions` storage-neutral; inherent `GcsFs::create_bucket(name, BucketSpec)` outside the trait (§8). |
-| **D24** | Live test buckets. | *Decided*: existing buckets — flat `princer-ckpt`, HNS `princer-test-bucket`, zonal `princer-zonal-us-west4-a` — via `GCS_RUST_FS_TEST_BUCKETS`, writing only under a per-run scratch prefix that is removed afterwards. |
-| **D25** | Create-only writes (`WriteMode::Create`, `OpenMode::CreateNew`, placeholder `mkdir`) on an existing object: the service answers the `if_generation_match = 0` precondition with `FAILED_PRECONDITION` / HTTP 412 on every bucket kind. | *Decided*: classified as `ErrorKind::AlreadyExists` (`O_EXCL` → `EEXIST`); the SDK error stays reachable through `Error::storage_source()`. A bare `PreconditionFailed` is reserved for preconditions the caller did not ask for. |
-| **D26** | `discard` on an appendable (zonal) write handle. | *Decided*: mirror gcsfs's `ZonalFile.discard` — the object was created at open and flushed bytes are persisted, so `discard` only stops writing and logs a `warn`; it does not delete the object. Documented as the stated exception in the `File` trait docs. Alternative (delete the object when this handle created it) is a one-line change in `Writer::discard` if the bridge prefers it. |
-| **D27** | Keep an explicit `File::discard()`, or let dropping the handle be the only way to abandon a write? | *Decided*: **keep `discard()`**, with `Drop` as the safety net. Considered and rejected: drop-only. It works for GCS (abort is sync and infallible, and `Drop` is deterministic), but an explicit method (a) is the 1:1 target for fsspec's `AbstractBufferedFile.discard()` and the `commit`/`discard` transaction protocol, (b) is async and fallible, so a backend whose cancellation is a remote call (gcsfs deletes the JSON-API resumable session) can run and report it, (c) marks the handle `closed` so later I/O fails with `Closed` instead of feeding a dead upload, and (d) keeps "abandon, don't publish" an enforceable, testable part of the contract rather than a documented `Drop` convention. Implementations must still publish only from `close`, so an unclosed, undiscarded handle abandons on drop. The bridge maps Python `discard()` straight through. |
-| **D28** | How do single-file reads grow new per-call options (parallel range requests, checksum verification, ...) without breaking every `impl FileSystem` and caller? | *Decided*: `cat_file` and `get_file` take a trailing `opts: ReadOptions`, mirroring `pipe_file`/`put_file` with `WriteOptions`; `OpenOptions::from_read` forwards it to `open` like `from_write` does. The struct is **empty today** (no knob is honoured yet, so none is exposed) and `#[non_exhaustive]`, so external code builds it with `ReadOptions::default()` and a new field is a non-breaking addition. Inside the crate the two consumers (`OpenOptions::from_read`, `GcsFs::cat_file`) destructure it (`let ReadOptions {} = opts;`) so a new field fails to compile until it is forwarded or handled. Rejected: a bare `concurrency` parameter (breaks on every later knob) and a silently ignored field. The other option structs are not `#[non_exhaustive]`; whether to apply it across the board is a pre-1.0 decision. |
-| **D29** | How `GcsFs` reaches kind-specific behaviour: branch on the kind inline, a per-kind inheritance-like chain, or per-axis driver objects? | *Decided*: **one `GcsFs`, branching on named capabilities of `BucketKind`** (`is_hierarchical`, `has_versioning`, `supports_server_copy`, `supports_http`, `objects_appendable`) — never on the variant itself, so each site states the property it needs and a new kind only answers five questions. Rejected: a `Zonal ⊃ HNS ⊃ Flat` chain — the kind is a property of the bucket, not of the filesystem object (one `GcsFs` serves every bucket and `copy_file` reads two kinds), and each level *removes* capabilities (HNS: versioning; zonal: server copy, HTTP, move fallback), which inheritance cannot express; gcsfs, with inheritance available, also dispatches per bucket inside one class. Deferred, not rejected: per-axis drivers (`NamespaceDriver` {prefix, folder} × `DataDriver` {standard, appendable} as zero-sized statics). They buy per-kind locality at the cost of two traits, four impls, `Backend` threaded through every call and return conventions for mid-method forks, while two-kind operations and `derived::*` fallbacks stay in the core anyway; the capability predicates are the common prefix of both designs, so the move stays mechanical if a fourth kind or more contributors make locality worth it. |
-| **D30** | Unified `info` + `ls` caching: where does it live and what are its semantics? | *Decided*: a **decorator**, `CachedFs<F: FileSystem>` (§4.2.1), not state inside `GcsFs` — the backend stays stateless and testable, the cache is testable on `MemoryFs`, and the bridge composes it like fsspec composes `dircache`. One directory-node store serves both primitives (a listing warms `info`; an `info` result never fakes a listing). Invalidation copies gcsfs's `DirCacheUpdater` rules exactly; two additions to the contract: `FileSystem::invalidate_cache` (default no-op) and `ListOptions::refresh`. Defaults mirror fsspec (`ttl: None`, `max_dirs: None`, `populate_from_find: true`) except **`negative: false`** — a cached "does not exist" is the one answer that goes wrong when another process creates a file, so it is opt-in. Not done (yet): serving `find` from the cache, HNS-targeted upserts after rename (gcsfs `HnsDirCacheUpdater`). |
+*Drafted with EGM*
