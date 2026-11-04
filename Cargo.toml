@@ -15,6 +15,10 @@ categories = ["filesystem", "api-bindings", "asynchronous"]
 name = "gcs_rust_fs"
 path = "src/lib.rs"
 
+[[bin]]
+name = "gcsfs-sidecar"
+path = "src/bin/gcsfs_sidecar.rs"
+
 [dependencies]
 google-cloud-storage = "1"
 # Canonical gRPC status codes (error classification) and the paginator traits.
@@ -27,11 +31,20 @@ async-trait = "0.1"
 # Bounded concurrency for the derived bulk operations (cat, rm, copy, put).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # `rt` + `sync`: the resumable writer streams bytes through an mpsc channel into
-# a spawned upload task.
-tokio = { version = "1", features = ["macros", "fs", "io-util", "rt", "sync"] }
+# a spawned upload task; `net` + `signal` + `rt-multi-thread`: sidecar server.
+tokio = { version = "1", features = ["macros", "fs", "io-util", "net", "rt", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
 base64 = "0.22"
 tracing = "0.1"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

@@ -87,6 +87,7 @@ mod gcs;
 mod glob;
 mod options;
 mod range;
+pub mod rpc;
 mod stat;
 
 pub use cached::{CacheConfig, CacheStats, CachedFs};
@@ -101,6 +102,7 @@ pub use options::{
     WriteOptions, DEFAULT_CONCURRENCY,
 };
 pub use range::ByteRange;
+pub use rpc::{FileSystemRpcService, RemoteFile, RemoteFs};
 pub use stat::ObjectStat;
 
 /// The attribute macro that [`FileSystem`] and [`File`] are declared with.

@@ -35,31 +35,47 @@ Two things to know:
 
 ## Build
 
-This is a **library crate**; the only binaries are the examples.
+The crate produces a core library, an out-of-process gRPC daemon binary (`gcsfs-sidecar`), and CLI examples:
 
 | Command | Output |
 |---------|--------|
 | `cargo build` | debug library (`target/debug/libgcs_rust_fs.rlib`) |
 | `cargo build --release` | optimised library — what `gcsfs` links against |
+| `cargo build --bin gcsfs-sidecar [--release]` | `target/{debug,release}/gcsfs-sidecar` |
 | `cargo build --examples [--release]` | `target/{debug,release}/examples/gcs` |
 
 CI builds with `-D warnings`, so a warning that is harmless locally fails the
 pipeline.
 
-### Running the example binary
+### Running the `gcsfs-sidecar` UDS Server
 
-`examples/gcs.rs` is a small CLI over the `FileSystem` trait:
+Run the sidecar daemon listening on Unix Domain Sockets:
 
 ```bash
-cargo run --example gcs -- info   gs://my-bucket/path
-cargo run --example gcs -- ls     gs://my-bucket/dir [--versions]
+# Listen on a single UDS socket with permissions 0666 and in-memory metadata caching
+cargo run --bin gcsfs-sidecar -- --uds /tmp/gcsfs.sock --mode 0666 --cache
+
+# Listen simultaneously across multiple UDS sockets
+cargo run --bin gcsfs-sidecar -- \
+  --uds /tmp/gcsfs-worker0.sock \
+  --uds /tmp/gcsfs-worker1.sock \
+  --mode 0666
+```
+
+### Running the example binary
+
+`examples/gcs.rs` is a small CLI over the `FileSystem` trait. It can talk directly to Google Cloud Storage or connect to a running `gcsfs-sidecar` over UDS via `--uds <PATH>`:
+
+```bash
+cargo run --example gcs -- info   gs://my-bucket/path [--uds /tmp/gcsfs.sock]
+cargo run --example gcs -- ls     gs://my-bucket/dir [--versions] [--uds /tmp/gcsfs.sock]
 cargo run --example gcs -- find   gs://my-bucket/dir [--withdirs] [--maxdepth N]
 cargo run --example gcs -- walk   gs://my-bucket/dir
 cargo run --example gcs -- du     gs://my-bucket/dir
-cargo run --example gcs -- cat    gs://my-bucket/file [--start N] [--end N]
+cargo run --example gcs -- cat    gs://my-bucket/file [--start N] [--end N] [--uds /tmp/gcsfs.sock]
 cargo run --example gcs -- get    gs://my-bucket/file ./local
 cargo run --example gcs -- put    ./local gs://my-bucket/file
-cargo run --example gcs -- pipe   gs://my-bucket/file "some text"
+cargo run --example gcs -- pipe   gs://my-bucket/file "some text" [--uds /tmp/gcsfs.sock]
 cargo run --example gcs -- cp     gs://my-bucket/src gs://my-bucket/dst [-r]
 cargo run --example gcs -- mv     gs://my-bucket/src gs://my-bucket/dst [-r]
 cargo run --example gcs -- rm     gs://my-bucket/path [-r]
@@ -71,7 +87,8 @@ cargo run --example gcs -- kind   my-bucket          # flat | hierarchical | zon
 `--start`/`--end` use Python-slice semantics. Pick the data transport for
 non-zonal buckets with `--transport grpc|http` or `GCS_RUST_FS_TRANSPORT`;
 bidi gRPC (the default) falls back to HTTP when the service reports it
-unavailable for a bucket. A built binary runs standalone:
+unavailable for a bucket. Pass `--uds <PATH>` to route operations through the
+local `gcsfs-sidecar` UDS server. A built binary runs standalone:
 `./target/release/examples/gcs ls gs://b/dir`.
 
 ## Test

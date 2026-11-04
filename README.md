@@ -1,4 +1,6 @@
-# gcs-rust-fs
+# gcs-rust-fs Blueprint
+
+## System Overview
 
 Non-POSIX, pure-Rust file-system primitives for Google Cloud Storage, built on
 the official [`google-cloud-storage`](https://docs.rs/google-cloud-storage)
@@ -244,6 +246,39 @@ cargo run --example gcs -- rm    gs://my-bucket/dir -r
 cargo run --example gcs -- kind  my-bucket
 ```
 
+## Running the `gcsfs-sidecar` UDS Server
+ 
+`gcs-rust-fs` provides an out-of-process gRPC daemon (`gcsfs-sidecar`) that serves `gcsfs.v1.FileSystemService` over Unix Domain Sockets:
+ 
+```bash
+# Start server listening on /tmp/gcsfs.sock
+cargo run --bin gcsfs-sidecar -- --uds /tmp/gcsfs.sock --mode 0666 --cache
+
+# Or serve multiple UDS paths simultaneously:
+cargo run --bin gcsfs-sidecar -- \
+  --uds /tmp/gcsfs-worker0.sock \
+  --uds /tmp/gcsfs-worker1.sock \
+  --mode 0666
+```
+
+### Testing the Running Server with the CLI
+
+Point `examples/gcs.rs` at the running socket via `--uds <PATH>`:
+
+```bash
+# Query info via UDS
+cargo run --example gcs -- info gs://my-bucket/checkpoint.pt --uds /tmp/gcsfs.sock
+
+# List directory contents via UDS
+cargo run --example gcs -- ls gs://my-bucket/data --uds /tmp/gcsfs.sock
+
+# Stream byte range via UDS
+cargo run --example gcs -- cat gs://my-bucket/checkpoint.pt --start 0 --end 1024 --uds /tmp/gcsfs.sock
+
+# Write data via UDS stream
+cargo run --example gcs -- pipe gs://my-bucket/hello.txt "hello from uds" --uds /tmp/gcsfs.sock
+```
+
 ## Development
 
 ```bash
@@ -254,6 +289,30 @@ GCS_RUST_FS_TEST_BUCKETS=flat=b1,hns=b2,zonal=b3 cargo test --test live         
 
 Building the example binary, the CI lint gate and the repo layout are in
 [`docs/dev_guide.md`](docs/dev_guide.md).
+
+## Local Interface & Invariants
+- `[build.rs:main]`: Cargo build script executing `tonic_prost_build` to compile `proto/gcsfs/v1/filesystem.proto` into Rust tonic client/server code during crate build.
+- `[build.rs:rerun-if-changed]`: Re-runs code generation whenever `proto/gcsfs/v1/filesystem.proto` is modified.
+
+## Subdirectories & System Boundaries
+- [src](./src/README.md): Core `FileSystem` and `File` async traits, error classification, range abstractions (`ByteRange`), in-memory directory cache decorator (`CachedFs`), GCS storage backend (`gcs`), and gRPC sidecar daemon (`bin`, `rpc`).
+- [proto](./proto/README.md): Protobuf schema root for all RPC service definitions and data serialization contracts used across `gcs-rust-fs`.
+- [examples](./examples/README.md): CLI example utility (`examples/gcs.rs`) for interacting with Google Cloud Storage buckets (Flat, Hierarchical Namespace, and Zonal) using the `FileSystem` interface.
+
+## Global Invariants
+- Directories are emulated within flat buckets via `/` delimiters and placeholder objects; Hierarchical Namespace (HNS) buckets provide real server-side directory objects and atomic folder renames.
+- Read handles pin the object generation at open time, guaranteeing immutable snapshot reads immune to concurrent overwrites or deletions.
+- Regular writes are staged and published atomically on Cloud Storage only upon successful `close()`; unclosed dropped handles discard pending uploads.
+- Python-slice byte range indexing (`ByteRange`) applies across all read APIs, resolving bounds backwards for negative indices and returning empty byte buffers for out-of-range reads.
+- Cache entries in `CachedFs` never store file payload data; mutating operations consistently invalidate affected directories, ancestors, or entire subtrees across both flat and hierarchical stores.
+
+## Global Side Effects
+- Cloud Storage Remote State: Communicates over gRPC and HTTP with Google Cloud Storage endpoints, creating, rewriting, renaming, and deleting objects and folders.
+- Sidecar IPC & Networking: Binds Unix Domain Sockets or TCP sockets to serve incoming `FileSystemService` requests.
+- Local Disk I/O: Reads local files for upload (`put`), writes downloaded objects (`get`), and generates Protobuf Rust code in `OUT_DIR` via `build.rs`.
+
+## System Verification
+- Run: `cargo test`
 
 ## Roadmap
 

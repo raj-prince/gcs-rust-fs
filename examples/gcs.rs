@@ -20,13 +20,15 @@
 //!
 //! `--transport grpc|http` (or `GCS_RUST_FS_TRANSPORT`) picks the data path
 //! for non-zonal buckets. `--start`/`--end` use Python-slice semantics.
+//! `--uds <PATH>` connects to a running `gcsfs-sidecar` UDS server instead of GCS directly.
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use gcs_rust_fs::{
     ByteRange, CopyOptions, DuOptions, Entry, FileSystem, FindOptions, GcsFs, ListOptions,
-    MkdirOptions, ReadOptions, RmOptions, Transport, WalkOptions, WriteOptions,
+    MkdirOptions, ReadOptions, RemoteFs, RmOptions, Transport, WalkOptions, WriteOptions,
 };
 
 struct Args {
@@ -37,6 +39,7 @@ struct Args {
     end: Option<i64>,
     maxdepth: Option<usize>,
     transport: Option<Transport>,
+    uds: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -50,6 +53,7 @@ fn parse_args() -> Result<Args, String> {
         end: None,
         maxdepth: None,
         transport: None,
+        uds: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -61,6 +65,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--transport" => {
                 out.transport = Some(value("--transport")?.parse().map_err(|e| format!("{e}"))?)
+            }
+            "--uds" => {
+                out.uds = Some(value("--uds")?);
             }
             flag if flag.starts_with('-') => out.flags.push(flag.to_string()),
             _ => out.positional.push(arg),
@@ -87,11 +94,15 @@ fn print_entry(e: &Entry) {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = GcsFs::builder().from_env()?;
-    if let Some(transport) = args.transport {
-        builder = builder.transport(transport);
-    }
-    let fs = builder.build().await?;
+    let fs: Arc<dyn FileSystem> = if let Some(uds_path) = &args.uds {
+        Arc::new(RemoteFs::connect_uds(uds_path).await?)
+    } else {
+        let mut builder = GcsFs::builder().from_env()?;
+        if let Some(transport) = args.transport {
+            builder = builder.transport(transport);
+        }
+        Arc::new(builder.build().await?)
+    };
     let recursive = args.flag("-r") || args.flag("--recursive");
 
     match args.command.as_str() {
@@ -199,7 +210,13 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             fs.mkdir(args.arg(0, "path")?, opts).await?;
         }
         "rmdir" => fs.rmdir(args.arg(0, "path")?).await?,
-        "kind" => println!("{}", fs.bucket_kind(args.arg(0, "bucket")?).await?),
+        "kind" => {
+            if args.uds.is_some() {
+                return Err("bucket 'kind' inspection requires direct GcsFs connection (cannot query via UDS)".into());
+            }
+            let gcs = GcsFs::builder().from_env()?.build().await?;
+            println!("{}", gcs.bucket_kind(args.arg(0, "bucket")?).await?);
+        }
         other => return Err(format!("unknown command {other:?}").into()),
     }
     Ok(())
