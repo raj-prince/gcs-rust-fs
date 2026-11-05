@@ -90,7 +90,9 @@ mod range;
 pub mod rpc;
 mod stat;
 
-pub use cached::{CacheConfig, CacheStats, CachedFs};
+pub use cached::{
+    CacheConfig, CacheStats, CachedFs, DataConfig, ObjectKey, PageCacheConfig, ReadaheadConfig,
+};
 pub use entry::{DiskUsage, Entry, EntryKind, WalkEntry};
 pub use error::{classify_storage_error, Error, ErrorKind, Result, StorageError};
 pub use file::File;
@@ -98,8 +100,8 @@ pub use filesystem::FileSystem;
 pub use gcs::{BucketKind, BucketSpec, GcsFile, GcsFs, GcsFsBuilder, Transport, PROJECT_ENV_VARS};
 pub use options::{
     BulkOptions, CopyOptions, DuOptions, FindOptions, GlobOptions, ListOptions, MkdirOptions,
-    OnError, OpenMode, OpenOptions, PutOptions, ReadOptions, RmOptions, WalkOptions, WriteMode,
-    WriteOptions, DEFAULT_CONCURRENCY,
+    OnError, OpenMode, OpenOptions, PutOptions, ReadOptions, ReadPattern, RmOptions, WalkOptions,
+    WriteMode, WriteOptions, DEFAULT_CONCURRENCY,
 };
 pub use range::ByteRange;
 pub use rpc::{FileSystemRpcService, RemoteFile, RemoteFs};

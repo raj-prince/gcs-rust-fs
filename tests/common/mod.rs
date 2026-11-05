@@ -420,3 +420,145 @@ pub fn paths(entries: &[Entry]) -> Vec<&str> {
 pub fn text(bytes: &Bytes) -> &str {
     std::str::from_utf8(bytes).unwrap()
 }
+
+// ===========================================================================
+// Counting Spy File & Filesystem for I/O and Prefetch Verification
+// ===========================================================================
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+#[derive(Default, Debug)]
+pub struct CountingMetrics {
+    pub read_range_calls: AtomicUsize,
+    pub read_range_bytes: AtomicU64,
+    pub read_calls: AtomicUsize,
+    pub read_bytes: AtomicU64,
+}
+
+pub struct CountingFile {
+    pub inner: Box<dyn File>,
+    pub metrics: Arc<CountingMetrics>,
+}
+
+#[async_trait]
+impl File for CountingFile {
+    fn path(&self) -> &str {
+        self.inner.path()
+    }
+
+    fn mode(&self) -> OpenMode {
+        self.inner.mode()
+    }
+
+    fn closed(&self) -> bool {
+        self.inner.closed()
+    }
+
+    fn tell(&self) -> u64 {
+        self.inner.tell()
+    }
+
+    fn size(&self) -> Option<u64> {
+        self.inner.size()
+    }
+
+    fn stat(&self) -> Option<&ObjectStat> {
+        self.inner.stat()
+    }
+
+    fn readable(&self) -> bool {
+        self.inner.readable()
+    }
+
+    fn writable(&self) -> bool {
+        self.inner.writable()
+    }
+
+    fn seekable(&self) -> bool {
+        self.inner.seekable()
+    }
+
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        self.inner.seek(pos)
+    }
+
+    async fn read(&mut self, len: Option<usize>) -> Result<Bytes> {
+        let res = self.inner.read(len).await?;
+        self.metrics.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.metrics.read_bytes.fetch_add(res.len() as u64, Ordering::Relaxed);
+        Ok(res)
+    }
+
+    async fn read_range(&self, range: ByteRange) -> Result<Bytes> {
+        let res = self.inner.read_range(range).await?;
+        self.metrics.read_range_calls.fetch_add(1, Ordering::Relaxed);
+        self.metrics.read_range_bytes.fetch_add(res.len() as u64, Ordering::Relaxed);
+        Ok(res)
+    }
+
+    async fn write(&mut self, data: Bytes) -> Result<()> {
+        self.inner.write(data).await
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.inner.close().await
+    }
+
+    async fn discard(&mut self) -> Result<()> {
+        self.inner.discard().await
+    }
+}
+
+#[derive(Clone)]
+pub struct SpyFs<F> {
+    pub inner: F,
+    pub metrics: Arc<CountingMetrics>,
+}
+
+impl<F> SpyFs<F> {
+    pub fn new(inner: F) -> (Self, Arc<CountingMetrics>) {
+        let metrics = Arc::new(CountingMetrics::default());
+        (
+            Self {
+                inner,
+                metrics: Arc::clone(&metrics),
+            },
+            metrics,
+        )
+    }
+}
+
+#[async_trait]
+impl<F: FileSystem> FileSystem for SpyFs<F> {
+    async fn info(&self, path: &str) -> Result<Entry> {
+        self.inner.info(path).await
+    }
+
+    async fn ls(&self, path: &str, opts: ListOptions) -> Result<Vec<Entry>> {
+        self.inner.ls(path, opts).await
+    }
+
+    async fn open(&self, path: &str, opts: OpenOptions) -> Result<Box<dyn File>> {
+        let inner_file = self.inner.open(path, opts).await?;
+        Ok(Box::new(CountingFile {
+            inner: inner_file,
+            metrics: Arc::clone(&self.metrics),
+        }))
+    }
+
+    async fn rm_file(&self, path: &str) -> Result<()> {
+        self.inner.rm_file(path).await
+    }
+
+    async fn mkdir(&self, path: &str, opts: MkdirOptions) -> Result<()> {
+        self.inner.mkdir(path, opts).await
+    }
+
+    async fn rmdir(&self, path: &str) -> Result<()> {
+        self.inner.rmdir(path).await
+    }
+}

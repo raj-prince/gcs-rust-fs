@@ -2,16 +2,19 @@
 //! [`FileSystem`]. The semantics are documented on the struct; this module
 //! is private and re-exported flat from the crate root.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_util::future::{BoxFuture, FutureExt, Shared};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::dircache::{parent_key, DirCache, Lookup};
 use crate::entry::{self, Entry};
@@ -20,7 +23,7 @@ use crate::file::File;
 use crate::filesystem::FileSystem;
 use crate::options::{
     CopyOptions, FindOptions, ListOptions, MkdirOptions, OpenMode, OpenOptions, PutOptions,
-    ReadOptions, RmOptions, WriteOptions,
+    ReadOptions, ReadPattern, RmOptions, WriteOptions,
 };
 use crate::range::ByteRange;
 use crate::stat::ObjectStat;
@@ -41,6 +44,9 @@ pub struct CacheConfig {
     pub negative: bool,
     /// Let a complete `find` fill the listing of every directory it visits.
     pub populate_from_find: bool,
+    /// Data caching and asynchronous readahead configuration.
+    /// `None` = data operations are passed through unbuffered and unreadahead.
+    pub data: Option<DataConfig>,
 }
 
 impl Default for CacheConfig {
@@ -50,6 +56,257 @@ impl Default for CacheConfig {
             max_dirs: None,
             negative: false,
             populate_from_find: true,
+            data: None,
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Configure data caching and asynchronous readahead.
+    pub fn with_data(mut self, data: DataConfig) -> Self {
+        self.data = Some(data);
+        self
+    }
+}
+
+/// Key uniquely identifying an immutable Cloud Storage object generation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ObjectKey {
+    /// The bucket name.
+    pub bucket: Arc<str>,
+    /// The object path within the bucket.
+    pub object: Arc<str>,
+    /// Content generation.
+    pub generation: i64,
+}
+
+/// Data caching and readahead configuration for [`CachedFs`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DataConfig {
+    /// Asynchronous readahead engine configuration.
+    pub readahead: ReadaheadConfig,
+    /// Shared page cache configuration (`None` = Mode 1 readahead-only; `Some` = Mode 2 shared page cache).
+    pub cache: Option<PageCacheConfig>,
+}
+
+impl DataConfig {
+    /// Create readahead-only (Mode 1) configuration with default readahead tuning.
+    pub fn readahead_only() -> Self {
+        Self {
+            readahead: ReadaheadConfig::default(),
+            cache: None,
+        }
+    }
+
+    /// Create shared page cache (Mode 2) configuration with default tuning and specified capacity.
+    pub fn page_cache(capacity: usize) -> Self {
+        Self {
+            readahead: ReadaheadConfig::default(),
+            cache: Some(PageCacheConfig { capacity }),
+        }
+    }
+}
+
+/// Readahead engine tuning parameters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadaheadConfig {
+    /// Fundamental page unit for indexing and alignment (default: 256 KiB).
+    pub page_size: usize,
+    /// Maximum readahead window size in bytes (default: 64 MiB).
+    pub max_readahead: usize,
+    /// Initial / default folio request size in bytes (default: 8 MiB).
+    pub io_size: usize,
+    /// Maximum folio request size in bytes (default: 32 MiB).
+    pub max_folio_size: usize,
+    /// Maximum concurrent folios in flight per handle (default: 8).
+    pub max_inflight: usize,
+    /// Global limit on in-flight speculative download bytes across all handles (default: 256 MiB).
+    pub max_inflight_bytes: usize,
+}
+
+impl Default for ReadaheadConfig {
+    fn default() -> Self {
+        Self {
+            page_size: 256 * 1024,
+            max_readahead: 64 * 1024 * 1024,
+            io_size: 8 * 1024 * 1024,
+            max_folio_size: 32 * 1024 * 1024,
+            max_inflight: 8,
+            max_inflight_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// Shared page cache configuration (Mode 2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageCacheConfig {
+    /// Global resident memory capacity in bytes (default: 512 MiB).
+    pub capacity: usize,
+}
+
+impl Default for PageCacheConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// A contiguous block of pages representing a single backend fetch response.
+pub struct Folio {
+    /// First page index (in page_size units).
+    pub first_page: u64,
+    /// Total pages in this folio.
+    pub num_pages: u32,
+    /// Linux-style `PG_readahead` marker.
+    pub readahead_mark: AtomicBool,
+    /// Folio state (loading future, ready bytes, or quarantined failure).
+    pub state: Mutex<FolioState>,
+}
+
+/// Lifecycle state of a [`Folio`].
+#[derive(Clone)]
+pub enum FolioState {
+    /// In-flight fetch future shared among concurrent readers.
+    Loading(Shared<BoxFuture<'static, std::result::Result<Bytes, Arc<Error>>>>),
+    /// Downloaded and verified bytes.
+    Ready(Bytes),
+    /// Quarantined terminal error.
+    Failed(Arc<Error>),
+}
+
+/// Shared per-object page directory in Mode 2.
+pub struct ObjectPages {
+    /// Identity of the object.
+    pub key: ObjectKey,
+    /// Object size in bytes.
+    #[allow(dead_code)]
+    pub size: u64,
+    /// Sparse map of start page index -> folio.
+    pub folios: Mutex<BTreeMap<u64, Arc<Folio>>>,
+}
+
+/// Global LRU page cache across all objects in Mode 2.
+pub struct PageCache {
+    /// Active objects.
+    pub objects: Mutex<HashMap<ObjectKey, Arc<ObjectPages>>>,
+    /// Logical clock for LRU recency ordering.
+    pub tick: AtomicU64,
+    /// Map of tick -> (ObjectKey, start_page).
+    pub recency: Mutex<BTreeMap<u64, (ObjectKey, u64)>>,
+    /// Current resident bytes across all ready folios.
+    pub used_bytes: AtomicUsize,
+    /// Capacity ceiling in bytes.
+    pub capacity_bytes: usize,
+}
+
+impl PageCache {
+    /// Create a new shared page cache with the specified byte budget.
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self {
+            objects: Mutex::new(HashMap::new()),
+            tick: AtomicU64::new(0),
+            recency: Mutex::new(BTreeMap::new()),
+            used_bytes: AtomicUsize::new(0),
+            capacity_bytes,
+        }
+    }
+
+    /// Record an access to a folio, updating its position in the LRU recency list.
+    pub fn record_access(&self, key: &ObjectKey, first_page: u64) {
+        let t = self.tick.fetch_add(1, Ordering::Relaxed);
+        let mut rec = self.recency.lock().unwrap_or_else(|e| e.into_inner());
+        rec.insert(t, (key.clone(), first_page));
+    }
+
+    /// Register newly resident bytes and evict older folios if above capacity.
+    pub fn add_bytes(&self, bytes: usize) {
+        self.used_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.evict_if_needed();
+    }
+
+    /// Evict folios in LRU order until `used_bytes <= capacity_bytes`.
+    pub fn evict_if_needed(&self) {
+        while self.used_bytes.load(Ordering::Relaxed) > self.capacity_bytes {
+            let victim = {
+                let mut rec = self.recency.lock().unwrap_or_else(|e| e.into_inner());
+                let first_key = rec.keys().next().copied();
+                if let Some(k) = first_key {
+                    rec.remove(&k)
+                } else {
+                    None
+                }
+            };
+
+            let Some((obj_key, page)) = victim else {
+                break;
+            };
+
+            let obj = {
+                let objs = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+                objs.get(&obj_key).cloned()
+            };
+
+            if let Some(obj) = obj {
+                let removed_bytes = {
+                    let mut folios = obj.folios.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(f) = folios.get(&page) {
+                        let st = f.state.lock().unwrap_or_else(|e| e.into_inner());
+                        match *st {
+                            FolioState::Ready(ref b) => {
+                                let len = b.len();
+                                drop(st);
+                                folios.remove(&page);
+                                Some(len)
+                            }
+                            FolioState::Loading(ref shared_fut) => {
+                                if let Some(Ok(ref b)) = shared_fut.peek() {
+                                    let len = b.len();
+                                    drop(st);
+                                    folios.remove(&page);
+                                    Some(len)
+                                } else {
+                                    None
+                                }
+                            }
+                            FolioState::Failed(_) => {
+                                drop(st);
+                                folios.remove(&page);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(bytes) = removed_bytes {
+                    self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Shared data runtime in [`CachedFs`].
+pub struct DataRuntime {
+    /// Global in-flight bandwidth semaphore.
+    pub inflight_semaphore: Arc<Semaphore>,
+    /// Global page cache (Mode 2) if configured.
+    pub cache: Option<Arc<PageCache>>,
+    /// Readahead configuration.
+    pub config: ReadaheadConfig,
+}
+
+impl DataRuntime {
+    /// Create a new runtime from [`DataConfig`].
+    pub fn new(config: DataConfig) -> Self {
+        let inflight_semaphore = Arc::new(Semaphore::new(config.readahead.max_inflight_bytes));
+        let cache = config.cache.map(|c| Arc::new(PageCache::new(c.capacity)));
+        Self {
+            inflight_semaphore,
+            cache,
+            config: config.readahead,
         }
     }
 }
@@ -127,17 +384,20 @@ pub struct CachedFs<F> {
     counters: Arc<Counters>,
     negative: bool,
     populate_from_find: bool,
+    data_runtime: Option<Arc<DataRuntime>>,
 }
 
 impl<F> CachedFs<F> {
     /// Wrap `inner`.
     pub fn new(inner: F, config: CacheConfig) -> Self {
+        let data_runtime = config.data.map(|d| Arc::new(DataRuntime::new(d)));
         Self {
             inner,
             cache: Arc::new(Mutex::new(DirCache::new(config.ttl, config.max_dirs))),
             counters: Arc::default(),
             negative: config.negative,
             populate_from_find: config.populate_from_find,
+            data_runtime,
         }
     }
 
@@ -219,6 +479,7 @@ impl<F: Clone> Clone for CachedFs<F> {
             counters: Arc::clone(&self.counters),
             negative: self.negative,
             populate_from_find: self.populate_from_find,
+            data_runtime: self.data_runtime.as_ref().map(Arc::clone),
         }
     }
 }
@@ -344,20 +605,73 @@ impl<F: FileSystem> FileSystem for CachedFs<F> {
     }
 
     async fn open(&self, path: &str, opts: OpenOptions) -> Result<Box<dyn File>> {
-        if !opts.mode.is_write() {
-            return self.inner.open(path, opts).await;
+        if opts.mode.is_write() {
+            let key = canonical(path);
+            let inner = self.inner.open(path, opts).await?;
+            // Appendable (zonal) objects exist from `open`; resumable uploads only
+            // from `close`. Invalidate at both points.
+            self.invalidated_write(&key);
+            return Ok(Box::new(CachedFile {
+                inner,
+                key,
+                cache: Arc::clone(&self.cache),
+                counters: Arc::clone(&self.counters),
+            }));
         }
-        let key = canonical(path);
-        let inner = self.inner.open(path, opts).await?;
-        // Appendable (zonal) objects exist from `open`; resumable uploads only
-        // from `close`. Invalidate at both points.
-        self.invalidated_write(&key);
-        Ok(Box::new(CachedFile {
-            inner,
-            key,
-            cache: Arc::clone(&self.cache),
-            counters: Arc::clone(&self.counters),
-        }))
+
+        if let Some(runtime) = &self.data_runtime {
+            let inner = self.inner.open(path, opts.clone()).await?;
+            let stat = inner.stat().cloned();
+            let size = inner.size().unwrap_or(0);
+            let key = canonical(path);
+
+            let index = if let (Some(stat_ref), Some(cache)) = (&stat, &runtime.cache) {
+                let obj_key = ObjectKey {
+                    bucket: Arc::from(stat_ref.bucket.as_str()),
+                    object: Arc::from(stat_ref.name.as_str()),
+                    generation: stat_ref.generation,
+                };
+                let pages = {
+                    let mut objs = cache.objects.lock().unwrap_or_else(|e| e.into_inner());
+                    objs.entry(obj_key.clone())
+                        .or_insert_with(|| {
+                            Arc::new(ObjectPages {
+                                key: obj_key,
+                                size,
+                                folios: Mutex::new(BTreeMap::new()),
+                            })
+                        })
+                        .clone()
+                };
+                Index::Shared {
+                    pages,
+                    cache: Arc::clone(cache),
+                }
+            } else {
+                Index::Private {
+                    folios: Arc::new(Mutex::new(BTreeMap::new())),
+                    cancel_token: Arc::new(Mutex::new(CancellationToken::new())),
+                }
+            };
+
+            let ra_pages = runtime.config.max_readahead / runtime.config.page_size;
+            let ra_state = ReadaheadState::new(opts.read_pattern, ra_pages.max(2));
+
+            Ok(Box::new(ReadaheadFile {
+                inner: Arc::from(inner),
+                path: key,
+                pos: 0,
+                size,
+                closed: false,
+                is_clone: false,
+                stat,
+                ra_state: Mutex::new(ra_state),
+                index,
+                runtime: Arc::clone(runtime),
+            }))
+        } else {
+            self.inner.open(path, opts).await
+        }
     }
 
     async fn rm_file(&self, path: &str) -> Result<()> {
@@ -466,6 +780,789 @@ impl<F: FileSystem> FileSystem for CachedFs<F> {
         let result = self.inner.put(local, path, opts).await;
         self.invalidated_tree(&canonical(path));
         result
+    }
+}
+
+/// Storage index for cached and prefetched folios.
+pub enum Index {
+    /// Mode 1: Private to this handle; drop-behind enabled; abort on seek/drop.
+    Private {
+        /// Map of start page -> folio.
+        folios: Arc<Mutex<BTreeMap<u64, Arc<Folio>>>>,
+        /// Token for cancelling active speculative background downloads.
+        cancel_token: Arc<Mutex<CancellationToken>>,
+    },
+    /// Mode 2: Shared across all handles for (bucket, object, generation); global LRU.
+    Shared {
+        /// Per-object pages directory.
+        pages: Arc<ObjectPages>,
+        /// Global page cache with LRU eviction.
+        cache: Arc<PageCache>,
+    },
+}
+
+/// Linux v6.6 `file_ra_state` port.
+pub struct ReadaheadState {
+    /// Start page index of the active readahead window.
+    pub start: u64,
+    /// Size of the readahead window in pages.
+    pub size: usize,
+    /// Number of pages at the tail of the window where the `PG_readahead` marker is set.
+    pub async_size: usize,
+    /// Maximum readahead window size in pages.
+    pub ra_pages: usize,
+    /// Last read byte offset (-1 if none).
+    pub prev_pos: i64,
+    /// Access pattern hint.
+    pub pattern: ReadPattern,
+}
+
+impl ReadaheadState {
+    /// Initialize state machine for a newly opened handle.
+    pub fn new(pattern: ReadPattern, ra_pages: usize) -> Self {
+        Self {
+            start: 0,
+            size: 0,
+            async_size: 0,
+            ra_pages,
+            prev_pos: -1,
+            pattern,
+        }
+    }
+
+    /// Reset readahead state upon non-contiguous seek or stream discontinuity.
+    pub fn reset(&mut self) {
+        self.start = 0;
+        self.size = 0;
+        self.async_size = 0;
+        self.prev_pos = -1;
+    }
+}
+
+/// Decorated read handle providing kernel-style readahead and page caching.
+pub struct ReadaheadFile {
+    inner: Arc<dyn File>,
+    path: String,
+    pos: u64,
+    size: u64,
+    closed: bool,
+    is_clone: bool,
+    stat: Option<ObjectStat>,
+    ra_state: Mutex<ReadaheadState>,
+    index: Index,
+    runtime: Arc<DataRuntime>,
+}
+
+impl ReadaheadFile {
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed || self.inner.closed() {
+            Err(Error::closed(&self.path))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Retrieve or initiate a folio covering `page_idx`.
+    async fn get_or_fetch_folio(&self, page_idx: u64) -> Result<Arc<Folio>> {
+        let (existing, cancel_token) = match &self.index {
+            Index::Private { folios, cancel_token } => {
+                let map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                let found = map
+                    .range(..=page_idx)
+                    .next_back()
+                    .and_then(|(&start, f)| {
+                        if start + (f.num_pages as u64) > page_idx {
+                            Some(Arc::clone(f))
+                        } else {
+                            None
+                        }
+                    });
+                let token = cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                (found, Some(token))
+            }
+            Index::Shared { pages, cache } => {
+                let map = pages.folios.lock().unwrap_or_else(|e| e.into_inner());
+                let found = map
+                    .range(..=page_idx)
+                    .next_back()
+                    .and_then(|(&start, f)| {
+                        if start + (f.num_pages as u64) > page_idx {
+                            Some(Arc::clone(f))
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(ref f) = found {
+                    cache.record_access(&pages.key, f.first_page);
+                }
+                (found, None)
+            }
+        };
+
+        if let Some(folio) = existing {
+            let state = folio.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match state {
+                FolioState::Ready(_) => return Ok(folio),
+                FolioState::Failed(err) => return Err(Error::new(err.kind(), err.to_string())),
+                FolioState::Loading(shared_fut) => {
+                    match shared_fut.await {
+                        Ok(b) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Ready(b);
+                            drop(st);
+                            return Ok(folio);
+                        }
+                        Err(err) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Failed(Arc::clone(&err));
+                            drop(st);
+                            return Err(Error::new(err.kind(), err.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Folio is absent: decide window size and initiate synchronous fetch (and optional readahead expansion)
+        self.ondemand_readahead(page_idx, 1).await?;
+
+        // After ondemand_readahead, folio should now exist in map
+        let created = match &self.index {
+            Index::Private { folios, .. } => {
+                let map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                map.range(..=page_idx)
+                    .next_back()
+                    .and_then(|(&start, f)| {
+                        if start + (f.num_pages as u64) > page_idx {
+                            Some(Arc::clone(f))
+                        } else {
+                            None
+                        }
+                    })
+            }
+            Index::Shared { pages, cache } => {
+                let map = pages.folios.lock().unwrap_or_else(|e| e.into_inner());
+                let found = map
+                    .range(..=page_idx)
+                    .next_back()
+                    .and_then(|(&start, f)| {
+                        if start + (f.num_pages as u64) > page_idx {
+                            Some(Arc::clone(f))
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(ref f) = found {
+                    cache.record_access(&pages.key, f.first_page);
+                }
+                found
+            }
+        };
+
+        if let Some(folio) = created {
+            let state = folio.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match state {
+                FolioState::Ready(_) => Ok(folio),
+                FolioState::Failed(err) => Err(Error::new(err.kind(), err.to_string())),
+                FolioState::Loading(shared_fut) => {
+                    match shared_fut.await {
+                        Ok(b) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Ready(b);
+                            drop(st);
+                            Ok(folio)
+                        }
+                        Err(err) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Failed(Arc::clone(&err));
+                            drop(st);
+                            Err(Error::new(err.kind(), err.to_string()))
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: fetch a single folio directly
+            self.fetch_folio_range(page_idx, 1, false, cancel_token).await
+        }
+    }
+
+    /// Linux v6.6 `ondemand_readahead` logic: evaluate streak, compute window, and dispatch folios.
+    async fn ondemand_readahead(&self, page_idx: u64, req_pages: usize) -> Result<()> {
+        let (start, size, async_size) = {
+            let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
+            let page_size = self.runtime.config.page_size;
+            let total_pages = (self.size.saturating_add(page_size as u64 - 1) / page_size as u64).max(1);
+
+            if ra.pattern == ReadPattern::Random {
+                // Random pattern: exact requested page(s) only, no ladder
+                let count = req_pages.min((total_pages - page_idx) as usize);
+                (page_idx, count.max(1), 0)
+            } else if ra.pattern == ReadPattern::Sequential {
+                // Sequential hint: start directly at max_readahead
+                let win = ra.ra_pages;
+                let count = win.min((total_pages - page_idx) as usize);
+                let a_size = count / 2;
+                ra.start = page_idx;
+                ra.size = count;
+                ra.async_size = a_size;
+                (page_idx, count, a_size)
+            } else {
+                // Auto mode: Linux on-demand readahead
+                let prev_page = if ra.prev_pos >= 0 {
+                    (ra.prev_pos as u64) / page_size as u64
+                } else {
+                    u64::MAX
+                };
+
+                let is_sequential = prev_page != u64::MAX && (page_idx == prev_page || page_idx == prev_page + 1);
+
+                if !is_sequential && ra.size == 0 {
+                    // Initial read or random seek
+                    let initial_win = (req_pages * 4).max(4).min(ra.ra_pages);
+                    let count = initial_win.min((total_pages - page_idx) as usize);
+                    let a_size = count / 2;
+                    ra.start = page_idx;
+                    ra.size = count;
+                    ra.async_size = a_size;
+                    (page_idx, count, a_size)
+                } else if is_sequential {
+                    // Geometric ramp: double previous window
+                    let next_win = if ra.size == 0 {
+                        4.min(ra.ra_pages)
+                    } else {
+                        (ra.size * 2).min(ra.ra_pages)
+                    };
+                    let count = next_win.min((total_pages - page_idx) as usize);
+                    let a_size = count / 2;
+                    ra.start = page_idx;
+                    ra.size = count;
+                    ra.async_size = a_size;
+                    (page_idx, count, a_size)
+                } else {
+                    // Rule 7 (standalone random read): read exact pages without ramp
+                    let count = req_pages.min((total_pages - page_idx) as usize);
+                    (page_idx, count.max(1), 0)
+                }
+            }
+        };
+
+        self.submit_window(start, size, async_size).await
+    }
+
+    /// Submit a window of folios starting at `start` totaling `size` pages.
+    /// Sets the `readahead_mark` at `start + size - async_size`.
+    async fn submit_window(&self, start: u64, size: usize, async_size: usize) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+
+        let page_size = self.runtime.config.page_size;
+        let io_pages = (self.runtime.config.io_size / page_size).max(1);
+        let max_folio_pages = (self.runtime.config.max_folio_size / page_size).max(io_pages);
+
+        // If in sequential pattern, folio size can grow up to max_folio_size
+        let ra_pattern = self.ra_state.lock().unwrap_or_else(|e| e.into_inner()).pattern;
+        let target_folio_pages = if ra_pattern == ReadPattern::Sequential {
+            max_folio_pages
+        } else {
+            io_pages
+        };
+
+        let marker_page = if async_size > 0 && async_size <= size {
+            start + (size - async_size) as u64
+        } else {
+            u64::MAX
+        };
+
+        let cancel_token = match &self.index {
+            Index::Private { cancel_token, .. } => {
+                Some(cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            }
+            Index::Shared { .. } => None,
+        };
+
+        let mut curr_page = start;
+        let end_page = start + size as u64;
+
+        while curr_page < end_page {
+            let remain = (end_page - curr_page) as usize;
+            let folio_pages = remain.min(target_folio_pages);
+
+            let has_marker = curr_page <= marker_page && marker_page < curr_page + folio_pages as u64;
+
+            // Check if folio already exists
+            let exists = match &self.index {
+                Index::Private { folios, .. } => {
+                    let map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                    map.contains_key(&curr_page)
+                }
+                Index::Shared { pages, .. } => {
+                    let map = pages.folios.lock().unwrap_or_else(|e| e.into_inner());
+                    map.contains_key(&curr_page)
+                }
+            };
+
+            if !exists {
+                self.fetch_folio_range(curr_page, folio_pages, has_marker, cancel_token.clone()).await?;
+            }
+
+            curr_page += folio_pages as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Fetch a single folio spanning `[first_page, first_page + num_pages)`.
+    async fn fetch_folio_range(
+        &self,
+        first_page: u64,
+        num_pages: usize,
+        has_marker: bool,
+        token: Option<CancellationToken>,
+    ) -> Result<Arc<Folio>> {
+        let page_size = self.runtime.config.page_size;
+        let start_byte = first_page * page_size as u64;
+        let end_byte = (start_byte + (num_pages * page_size) as u64).min(self.size);
+
+        if start_byte >= self.size {
+            let folio = Arc::new(Folio {
+                first_page,
+                num_pages: num_pages as u32,
+                readahead_mark: AtomicBool::new(false),
+                state: Mutex::new(FolioState::Ready(Bytes::new())),
+            });
+            self.insert_folio(first_page, Arc::clone(&folio));
+            return Ok(folio);
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let semaphore = Arc::clone(&self.runtime.inflight_semaphore);
+        let cache_opt = self.runtime.cache.as_ref().map(Arc::clone);
+        let obj_key = if let Index::Shared { pages, .. } = &self.index {
+            Some(pages.key.clone())
+        } else {
+            None
+        };
+
+        let fetch_len = (end_byte - start_byte) as usize;
+
+        let fut = async move {
+            if let Some(ref t) = token {
+                if t.is_cancelled() {
+                    return Err(Arc::new(Error::new(crate::ErrorKind::Closed, "task cancelled")));
+                }
+            }
+
+            let _permit = semaphore
+                .acquire_many(fetch_len.max(1) as u32)
+                .await
+                .map_err(|_| Arc::new(Error::new(crate::ErrorKind::Other, "semaphore closed")))?;
+
+            if let Some(ref t) = token {
+                if t.is_cancelled() {
+                    return Err(Arc::new(Error::new(crate::ErrorKind::Closed, "task cancelled")));
+                }
+            }
+
+            // Retry loop for transient failures (up to 3 retries)
+            let mut delay = std::time::Duration::from_millis(50);
+            let mut last_err = None;
+
+            for _ in 0..3 {
+                let range = ByteRange::from(start_byte..end_byte);
+                match inner.read_range(range).await {
+                    Ok(bytes) => {
+                        if let (Some(cache), Some(ref key)) = (&cache_opt, &obj_key) {
+                            cache.add_bytes(bytes.len());
+                            cache.record_access(key, first_page);
+                        }
+                        return Ok(bytes);
+                    }
+                    Err(err) => {
+                        let kind = err.kind();
+                        let is_retryable = matches!(kind, crate::ErrorKind::Timeout | crate::ErrorKind::Other);
+                        last_err = Some(err);
+                        if is_retryable {
+                            tokio::time::sleep(delay).await;
+                            delay *= 3;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            Err(Arc::new(last_err.unwrap_or_else(|| {
+                Error::new(crate::ErrorKind::Other, "backend read failed after retries")
+            })))
+        };
+
+        let shared_fut = fut.boxed().shared();
+        let folio = Arc::new(Folio {
+            first_page,
+            num_pages: num_pages as u32,
+            readahead_mark: AtomicBool::new(has_marker),
+            state: Mutex::new(FolioState::Loading(shared_fut.clone())),
+        });
+
+        self.insert_folio(first_page, Arc::clone(&folio));
+
+        // Background supervisor task to update FolioState on completion
+        let folio_clone = Arc::clone(&folio);
+        tokio::spawn(async move {
+            match shared_fut.await {
+                Ok(bytes) => {
+                    let mut st = folio_clone.state.lock().unwrap_or_else(|e| e.into_inner());
+                    *st = FolioState::Ready(bytes);
+                }
+                Err(err) => {
+                    let mut st = folio_clone.state.lock().unwrap_or_else(|e| e.into_inner());
+                    *st = FolioState::Failed(err);
+                }
+            }
+        });
+
+        Ok(folio)
+    }
+
+    fn insert_folio(&self, first_page: u64, folio: Arc<Folio>) {
+        match &self.index {
+            Index::Private { folios, .. } => {
+                let mut map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                map.insert(first_page, folio);
+            }
+            Index::Shared { pages, .. } => {
+                let mut map = pages.folios.lock().unwrap_or_else(|e| e.into_inner());
+                map.insert(first_page, folio);
+            }
+        }
+    }
+
+    /// Trigger readahead pipeline when touching a folio with `readahead_mark`.
+    fn submit_async_readahead(&self) {
+        let (start, size, async_size) = {
+            let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
+            let page_size = self.runtime.config.page_size;
+            let total_pages = (self.size.saturating_add(page_size as u64 - 1) / page_size as u64).max(1);
+
+            let next_start = ra.start + ra.size as u64;
+            if next_start >= total_pages {
+                return;
+            }
+
+            let next_win = (ra.size * 2).min(ra.ra_pages).max(4);
+            let count = next_win.min((total_pages - next_start) as usize);
+            let a_size = count / 2;
+
+            ra.start = next_start;
+            ra.size = count;
+            ra.async_size = a_size;
+            (next_start, count, a_size)
+        };
+
+        // Spawn async window submission
+        let file = Arc::new(self.clone_handle());
+        tokio::spawn(async move {
+            let _ = file.submit_window(start, size, async_size).await;
+        });
+    }
+
+    fn clone_handle(&self) -> Self {
+        let ra_st = {
+            let ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
+            ReadaheadState::new(ra.pattern, ra.ra_pages)
+        };
+        Self {
+            inner: Arc::clone(&self.inner),
+            path: self.path.clone(),
+            pos: self.pos,
+            size: self.size,
+            closed: self.closed,
+            is_clone: true,
+            stat: self.stat.clone(),
+            ra_state: Mutex::new(ra_st),
+            index: match &self.index {
+                Index::Private { folios, cancel_token } => Index::Private {
+                    folios: Arc::clone(folios),
+                    cancel_token: Arc::clone(cancel_token),
+                },
+                Index::Shared { pages, cache } => Index::Shared {
+                    pages: Arc::clone(pages),
+                    cache: Arc::clone(cache),
+                },
+            },
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+}
+
+#[async_trait]
+impl File for ReadaheadFile {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn mode(&self) -> OpenMode {
+        OpenMode::Read
+    }
+
+    fn closed(&self) -> bool {
+        self.closed || self.inner.closed()
+    }
+
+    fn tell(&self) -> u64 {
+        self.pos
+    }
+
+    fn size(&self) -> Option<u64> {
+        Some(self.size)
+    }
+
+    fn stat(&self) -> Option<&ObjectStat> {
+        self.stat.as_ref()
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn seekable(&self) -> bool {
+        true
+    }
+
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        self.ensure_open()?;
+        let target = match pos {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::End(delta) => self.size as i64 + delta,
+            SeekFrom::Current(delta) => self.pos as i64 + delta,
+        };
+
+        if target < 0 {
+            return Err(Error::invalid_range("seek before the start of the file"));
+        }
+
+        let new_offset = (target as u64).min(self.size);
+        let forward_gap = 8 * 1024 * 1024; // 8 MiB forward gap tolerance
+
+        if let Index::Private { folios, cancel_token } = &self.index {
+            if new_offset >= self.pos && (new_offset - self.pos) <= forward_gap {
+                // Forward gap within 8 MiB: preserve in-flight tasks and readahead ladder
+                let page_size = self.runtime.config.page_size;
+                let target_page = new_offset / page_size as u64;
+                let mut map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                map.retain(|&start_page, f| start_page + (f.num_pages as u64) > target_page);
+            } else {
+                // Backward seek or large forward jump > 8 MiB: abort tasks and reset
+                let mut token_guard = cancel_token.lock().unwrap_or_else(|e| e.into_inner());
+                token_guard.cancel();
+                *token_guard = CancellationToken::new();
+
+                let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
+                ra.reset();
+
+                let page_size = self.runtime.config.page_size;
+                let target_page = new_offset / page_size as u64;
+                let mut map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                map.retain(|&start_page, f| start_page + (f.num_pages as u64) > target_page);
+            }
+        }
+
+        self.pos = new_offset;
+        Ok(self.pos)
+    }
+
+    async fn read(&mut self, len: Option<usize>) -> Result<Bytes> {
+        self.ensure_open()?;
+        let target_len = len
+            .unwrap_or((self.size.saturating_sub(self.pos)) as usize)
+            .min((self.size.saturating_sub(self.pos)) as usize);
+
+        if target_len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let page_size = self.runtime.config.page_size;
+        let mut buf = BytesMut::with_capacity(target_len);
+
+        while buf.len() < target_len && self.pos < self.size {
+            let page_idx = self.pos / page_size as u64;
+            let folio = self.get_or_fetch_folio(page_idx).await?;
+
+            if folio.readahead_mark.swap(false, Ordering::Relaxed) {
+                self.submit_async_readahead();
+            }
+
+            let folio_data = {
+                let st = folio.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match st {
+                    FolioState::Ready(b) => b,
+                    FolioState::Failed(err) => return Err(Error::new(err.kind(), err.to_string())),
+                    FolioState::Loading(shared_fut) => match shared_fut.await {
+                        Ok(b) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Ready(b.clone());
+                            b
+                        }
+                        Err(err) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Failed(Arc::clone(&err));
+                            return Err(Error::new(err.kind(), err.to_string()));
+                        }
+                    },
+                }
+            };
+
+            let offset_in_folio = (self.pos - (folio.first_page * page_size as u64)) as usize;
+            if offset_in_folio >= folio_data.len() {
+                break;
+            }
+
+            let avail = folio_data.len() - offset_in_folio;
+            let take = avail.min(target_len - buf.len());
+            buf.extend_from_slice(&folio_data[offset_in_folio..offset_in_folio + take]);
+            self.pos += take as u64;
+
+            // Maintain sequential readahead ladder continuity across folio boundaries
+            {
+                let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
+                ra.prev_pos = self.pos as i64;
+            }
+        }
+
+        // Update last-read byte position in readahead state
+        {
+            let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
+            ra.prev_pos = self.pos as i64;
+        }
+
+        // Drop-behind: in Mode 1, remove folios strictly behind the current cursor
+        if let Index::Private { folios, .. } = &self.index {
+            let current_page = self.pos / page_size as u64;
+            let mut map = folios.lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|&start_page, f| start_page + (f.num_pages as u64) > current_page);
+        }
+
+        Ok(buf.freeze())
+    }
+
+    async fn read_range(&self, range: ByteRange) -> Result<Bytes> {
+        self.ensure_open()?;
+        let clamped = range.clamp(self.size);
+        if clamped.is_empty() {
+            return Ok(Bytes::new());
+        }
+
+        let page_size = self.runtime.config.page_size;
+        let start_page = clamped.start / page_size as u64;
+        let end_page = (clamped.end + page_size as u64 - 1) / page_size as u64;
+
+        // In Mode 1: check private folios for hit; if miss, pass through directly
+        if let Index::Private { folios, .. } = &self.index {
+            let mut all_ready = true;
+            {
+                let map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                for p in start_page..end_page {
+                    let found = map
+                        .range(..=p)
+                        .next_back()
+                        .is_some_and(|(&start, f)| start + (f.num_pages as u64) > p);
+                    if !found {
+                        all_ready = false;
+                        break;
+                    }
+                }
+            }
+
+            if !all_ready {
+                return self.inner.read_range(clamped.into()).await;
+            }
+        }
+
+        // In Mode 2 (or Mode 1 hit): assemble from folios
+        let mut buf = BytesMut::with_capacity((clamped.end - clamped.start) as usize);
+        let mut cursor = clamped.start;
+
+        while cursor < clamped.end {
+            let p = cursor / page_size as u64;
+            let folio = self.get_or_fetch_folio(p).await?;
+
+            let folio_data = {
+                let st = folio.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match st {
+                    FolioState::Ready(b) => b,
+                    FolioState::Failed(err) => return Err(Error::new(err.kind(), err.to_string())),
+                    FolioState::Loading(shared_fut) => match shared_fut.await {
+                        Ok(b) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Ready(b.clone());
+                            b
+                        }
+                        Err(err) => {
+                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
+                            *st = FolioState::Failed(Arc::clone(&err));
+                            return Err(Error::new(err.kind(), err.to_string()));
+                        }
+                    },
+                }
+            };
+
+            let offset_in_folio = (cursor - (folio.first_page * page_size as u64)) as usize;
+            if offset_in_folio >= folio_data.len() {
+                break;
+            }
+
+            let avail = folio_data.len() - offset_in_folio;
+            let take = avail.min((clamped.end - cursor) as usize);
+            buf.extend_from_slice(&folio_data[offset_in_folio..offset_in_folio + take]);
+            cursor += take as u64;
+        }
+
+        Ok(buf.freeze())
+    }
+
+    async fn write(&mut self, _data: Bytes) -> Result<()> {
+        Err(Error::unsupported("write on a read handle"))
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.ensure_open()
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+
+        if !self.is_clone {
+            if let Index::Private { folios, cancel_token } = &self.index {
+                cancel_token.lock().unwrap_or_else(|e| e.into_inner()).cancel();
+                folios.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn discard(&mut self) -> Result<()> {
+        self.close().await
+    }
+}
+
+impl Drop for ReadaheadFile {
+    fn drop(&mut self) {
+        if !self.is_clone {
+            if let Index::Private { folios, cancel_token } = &self.index {
+                cancel_token.lock().unwrap_or_else(|e| e.into_inner()).cancel();
+                folios.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+        }
     }
 }
 
@@ -585,5 +1682,8 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CachedFs<crate::gcs::GcsFs>>();
         assert_send_sync::<CachedFile>();
+        assert_send_sync::<ReadaheadFile>();
+        assert_send_sync::<DataRuntime>();
+        assert_send_sync::<PageCache>();
     }
 }

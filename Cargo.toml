@@ -33,6 +33,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # `rt` + `sync`: the resumable writer streams bytes through an mpsc channel into
 # a spawned upload task; `net` + `signal` + `rt-multi-thread`: sidecar server.
 tokio = { version = "1", features = ["macros", "fs", "io-util", "net", "rt", "rt-multi-thread", "signal", "sync"] }
+tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"

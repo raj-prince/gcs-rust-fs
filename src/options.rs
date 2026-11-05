@@ -108,6 +108,18 @@ pub struct WriteOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadOptions {}
 
+/// Expected access pattern for readahead tuning, analogous to `posix_fadvise`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ReadPattern {
+    /// Adaptive Linux v6.6 on-demand readahead (default).
+    #[default]
+    Auto,
+    /// Known sequential stream: skips initial probe ramp, priming at max window with folios up to 32 MiB.
+    Sequential,
+    /// Random access: disables readahead window ladder, reading exact single-page folios.
+    Random,
+}
+
 /// Options for [`FileSystem::open`](crate::FileSystem::open).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpenOptions {
@@ -120,6 +132,8 @@ pub struct OpenOptions {
     pub content_type: Option<String>,
     /// User metadata for files created in a write mode.
     pub metadata: HashMap<String, String>,
+    /// Expected access pattern hint for read readahead.
+    pub read_pattern: ReadPattern,
 }
 
 impl OpenOptions {
@@ -144,6 +158,18 @@ impl OpenOptions {
         }
     }
 
+    /// Set the expected read pattern hint for readahead optimization.
+    pub fn with_pattern(mut self, pattern: ReadPattern) -> Self {
+        self.read_pattern = pattern;
+        self
+    }
+
+    /// Set the block size / readahead hint in bytes.
+    pub fn with_block_size(mut self, size: usize) -> Self {
+        self.block_size = Some(size);
+        self
+    }
+
     /// Translate whole-file [`ReadOptions`] into the equivalent open options.
     pub fn from_read(opts: ReadOptions) -> Self {
         // Destructured rather than ignored so that adding a field to
@@ -162,6 +188,7 @@ impl OpenOptions {
             block_size: opts.block_size,
             content_type: opts.content_type,
             metadata: opts.metadata,
+            read_pattern: ReadPattern::Auto,
         }
     }
 }
