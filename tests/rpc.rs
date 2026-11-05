@@ -510,6 +510,26 @@ async fn cached_readahead_sidecar_serves_bounded_random_and_large_sequential_rea
         .unwrap();
     assert_eq!(slice_16m.as_ref(), &payload[start_16m..end_16m]);
 
+    // Act 3: RemoteFile sequential streaming across multiple read() calls + random seek()
+    let mut rfile = client
+        .open("my-bucket/seq20m.bin", OpenOptions::read())
+        .await
+        .unwrap();
+    let chunk_a = rfile.read(Some(4 * 1024 * 1024)).await.unwrap();
+    let chunk_b = rfile.read(Some(4 * 1024 * 1024)).await.unwrap();
+    assert_eq!(chunk_a.as_ref(), &payload[0..4 * 1024 * 1024]);
+    assert_eq!(
+        chunk_b.as_ref(),
+        &payload[4 * 1024 * 1024..8 * 1024 * 1024]
+    );
+    rfile.seek(SeekFrom::Start(12 * 1024 * 1024)).unwrap();
+    let random_chunk = rfile.read(Some(1024 * 1024)).await.unwrap();
+    assert_eq!(
+        random_chunk.as_ref(),
+        &payload[12 * 1024 * 1024..13 * 1024 * 1024]
+    );
+    rfile.close().await.unwrap();
+
     // Cleanup
     let _ = tx.send(());
     let _ = handle.await;

@@ -26,12 +26,25 @@ use crate::rpc::proto::{
     WriteResponse,
 };
 
-/// Default chunk size (`1 MiB`) streamed per [`ReadResponse`] message.
+/// Default chunk size (`1 MiB`) streamed per [`ReadResponse`] message when
+/// the client does not specify `ReadOptions::chunk_size`.
 pub const DEFAULT_READ_CHUNK_SIZE: usize = 1024 * 1024;
 
-/// Maximum chunk size (`4 MiB` minus gRPC framing headroom = `3.5 MiB`) unless
-/// overridden, keeping individual frames safely below standard gRPC limits.
-pub const MAX_READ_CHUNK_SIZE: usize = 3 * 1024 * 1024 + 512 * 1024;
+/// Maximum chunk size (`8 MiB`) streamed per [`ReadResponse`] message when
+/// requested via `ReadOptions::chunk_size`.
+pub const MAX_READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Maximum gRPC message size (`16 MiB`) accepted and emitted by the sidecar.
+pub const MAX_GRPC_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// HTTP/2 initial per-stream flow-control window (`64 MiB`).
+const HTTP2_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+
+/// HTTP/2 initial connection-level flow-control window (`256 MiB`).
+const HTTP2_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
+
+/// HTTP/2 maximum frame size (`16 MiB - 1`, RFC 7540 limit).
+const HTTP2_MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
 /// gRPC service handler backed by any [`FileSystem`] implementation.
 #[derive(Clone)]
@@ -55,6 +68,15 @@ impl FileSystemRpcService {
     /// be registered with [`tonic::transport::Server`].
     pub fn into_server(self) -> FileSystemServiceServer<Self> {
         FileSystemServiceServer::new(self)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+    }
+
+    fn configured_server_builder() -> Server {
+        Server::builder()
+            .initial_stream_window_size(HTTP2_STREAM_WINDOW_SIZE)
+            .initial_connection_window_size(HTTP2_CONNECTION_WINDOW_SIZE)
+            .max_frame_size(HTTP2_MAX_FRAME_SIZE)
     }
 
     /// Serve the [`FileSystemService`] over a Unix Domain Socket at `socket_path`
@@ -106,7 +128,7 @@ impl FileSystemRpcService {
 
         let incoming = UnixListenerStream::new(uds);
 
-        Server::builder()
+        Self::configured_server_builder()
             .add_service(self.into_server())
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
@@ -166,7 +188,7 @@ impl FileSystemRpcService {
 
         let incoming = futures_util::stream::select_all(streams);
 
-        Server::builder()
+        Self::configured_server_builder()
             .add_service(self.into_server())
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
@@ -187,7 +209,7 @@ impl FileSystemRpcService {
             .map_err(|e| Error::io("bind_tcp", addr, e))?;
         let incoming = TcpListenerStream::new(listener);
 
-        Server::builder()
+        Self::configured_server_builder()
             .add_service(self.into_server())
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
@@ -291,17 +313,14 @@ impl FileSystemService for FileSystemRpcService {
             .await
             .map_err(error_to_status)?;
 
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let file_size = match handle.size() {
                 Some(s) => s,
-                None => {
-                    // Fall back to stat if size is somehow None
-                    match handle.stat() {
-                        Some(stat) => stat.size,
-                        None => 0,
-                    }
-                }
+                None => match handle.stat() {
+                    Some(stat) => stat.size,
+                    None => 0,
+                },
             };
 
             let std_range = range.clamp(file_size);
@@ -312,9 +331,11 @@ impl FileSystemService for FileSystemRpcService {
                 return;
             }
 
-            if let Err(e) = handle.seek(std::io::SeekFrom::Start(start)) {
-                let _ = tx.send(Err(error_to_status(e))).await;
-                return;
+            if start > 0 {
+                if let Err(e) = handle.seek(std::io::SeekFrom::Start(start)) {
+                    let _ = tx.send(Err(error_to_status(e))).await;
+                    return;
+                }
             }
 
             let mut remaining = end - start;

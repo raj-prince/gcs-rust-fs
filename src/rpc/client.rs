@@ -4,6 +4,8 @@
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -13,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Endpoint, Uri};
-use tonic::Response;
+use tonic::{Response, Streaming};
 use tower::service_fn;
 
 use crate::entry::Entry;
@@ -29,38 +31,76 @@ use crate::rpc::proto;
 use crate::rpc::proto::file_system_service_client::FileSystemServiceClient;
 use crate::rpc::proto::write_request::Payload;
 use crate::rpc::proto::{
-    InfoRequest, ListRequest, ReadRequest, WriteRequest, WriteResponse, WriteSpec,
+    InfoRequest, ListRequest, ReadOptions as ProtoReadOptions, ReadRequest, ReadResponse,
+    WriteRequest, WriteResponse, WriteSpec,
 };
-use crate::rpc::server::DEFAULT_READ_CHUNK_SIZE;
+use crate::rpc::server::{DEFAULT_READ_CHUNK_SIZE, MAX_GRPC_MESSAGE_SIZE, MAX_READ_CHUNK_SIZE};
 use crate::stat::ObjectStat;
 
-/// Default read-ahead block size (`5 MiB`) used by [`RemoteFile`] when
+/// Default read-ahead block size (`8 MiB`) used by [`RemoteFile`] when
 /// `OpenOptions::block_size` is unset.
-const DEFAULT_BLOCK_SIZE: usize = 5 * 1024 * 1024;
+const DEFAULT_BLOCK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Default number of parallel UDS HTTP/2 subchannels opened by [`RemoteFs::connect_uds`].
+const DEFAULT_UDS_POOL_SIZE: usize = 16;
+
+/// HTTP/2 initial per-stream flow-control window (`64 MiB`).
+const HTTP2_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+
+/// HTTP/2 initial connection-level flow-control window (`256 MiB`).
+const HTTP2_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
+
+/// HTTP/2 maximum frame size (`16 MiB - 1`, RFC 7540 limit).
+const HTTP2_MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
 /// A [`FileSystem`] client that delegates operations to a `gcs-rust-fs` gRPC
 /// sidecar server over a Unix Domain Socket or TCP connection.
 #[derive(Clone, Debug)]
 pub struct RemoteFs {
-    client: FileSystemServiceClient<Channel>,
+    clients: Arc<Vec<FileSystemServiceClient<Channel>>>,
+    next_idx: Arc<AtomicUsize>,
 }
 
 impl RemoteFs {
+    fn new_client(channel: Channel) -> FileSystemServiceClient<Channel> {
+        FileSystemServiceClient::new(channel)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+    }
+
     /// Wrap an existing Tonic [`Channel`].
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            client: FileSystemServiceClient::new(channel),
+            clients: Arc::new(vec![Self::new_client(channel)]),
+            next_idx: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Connect to a sidecar gRPC server listening on a Unix Domain Socket at
-    /// `socket_path` (e.g. `/var/run/gcsfs/sidecar.sock`).
-    pub async fn connect_uds(socket_path: impl AsRef<Path>) -> Result<Self> {
-        let path: PathBuf = socket_path.as_ref().to_path_buf();
+    /// Wrap multiple Tonic [`Channel`]s for round-robin load balancing.
+    pub fn from_channels(channels: Vec<Channel>) -> Self {
+        let clients = channels.into_iter().map(Self::new_client).collect();
+        Self {
+            clients: Arc::new(clients),
+            next_idx: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn next_client(&self) -> FileSystemServiceClient<Channel> {
+        if self.clients.len() == 1 {
+            return self.clients[0].clone();
+        }
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        self.clients[idx].clone()
+    }
+
+    async fn connect_one_uds(path: PathBuf) -> Result<Channel> {
         // Tonic requires a valid HTTP URI for the HTTP/2 authority header even
         // when the underlying transport is a Unix Domain Socket.
-        let channel = Endpoint::try_from("http://[::]:50051")
+        Endpoint::try_from("http://[::]:50051")
             .map_err(|e| Error::with_source(ErrorKind::ClientInit, "invalid dummy URI", e))?
+            .initial_stream_window_size(HTTP2_STREAM_WINDOW_SIZE)
+            .initial_connection_window_size(HTTP2_CONNECTION_WINDOW_SIZE)
+            .max_frame_size(HTTP2_MAX_FRAME_SIZE)
             .connect_with_connector(service_fn(move |_: Uri| {
                 let path = path.clone();
                 async move {
@@ -75,9 +115,29 @@ impl RemoteFs {
                     "failed to connect to gRPC Unix Domain Socket",
                     e,
                 )
-            })?;
+            })
+    }
 
-        Ok(Self::from_channel(channel))
+    /// Connect to a sidecar gRPC server listening on a Unix Domain Socket at
+    /// `socket_path` (e.g. `/var/run/gcsfs/sidecar.sock`).
+    pub async fn connect_uds(socket_path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_uds_with_pool_size(socket_path, DEFAULT_UDS_POOL_SIZE).await
+    }
+
+    /// Connect to a sidecar gRPC server listening on a Unix Domain Socket at
+    /// `socket_path` with a specified number of pooled UDS HTTP/2 connections.
+    pub async fn connect_uds_with_pool_size(
+        socket_path: impl AsRef<Path>,
+        pool_size: usize,
+    ) -> Result<Self> {
+        let path: PathBuf = socket_path.as_ref().to_path_buf();
+        let n = pool_size.max(1);
+        let mut futs = Vec::with_capacity(n);
+        for _ in 0..n {
+            futs.push(Self::connect_one_uds(path.clone()));
+        }
+        let channels = futures_util::future::try_join_all(futs).await?;
+        Ok(Self::from_channels(channels))
     }
 
     /// Connect to a sidecar gRPC server listening on a TCP endpoint (e.g.
@@ -92,6 +152,9 @@ impl RemoteFs {
                     e,
                 )
             })?
+            .initial_stream_window_size(HTTP2_STREAM_WINDOW_SIZE)
+            .initial_connection_window_size(HTTP2_CONNECTION_WINDOW_SIZE)
+            .max_frame_size(HTTP2_MAX_FRAME_SIZE)
             .connect()
             .await
             .map_err(|e| {
@@ -116,8 +179,8 @@ impl RemoteFs {
         let chunk_size = opts
             .block_size
             .filter(|&b| b > 0)
-            .unwrap_or(DEFAULT_READ_CHUNK_SIZE)
-            .min(DEFAULT_READ_CHUNK_SIZE);
+            .unwrap_or(MAX_READ_CHUNK_SIZE)
+            .min(MAX_READ_CHUNK_SIZE);
 
         let spec = WriteSpec {
             path: path.to_owned(),
@@ -141,7 +204,7 @@ impl RemoteFs {
             offset = end;
         }
 
-        let mut client = self.client.clone();
+        let mut client = self.next_client();
         let response = client
             .write(tokio_stream::iter(messages))
             .await
@@ -150,36 +213,22 @@ impl RemoteFs {
 
         Ok((response.size, response.stat.map(ObjectStat::from)))
     }
-}
 
-#[async_trait]
-impl FileSystem for RemoteFs {
-    async fn info(&self, path: &str) -> Result<Entry> {
-        let mut client = self.client.clone();
-        let response = client
-            .info(InfoRequest {
-                path: path.to_owned(),
-            })
-            .await
-            .map_err(status_to_error)?
-            .into_inner();
-
-        let proto_entry = response.entry.ok_or_else(|| {
-            Error::new(
-                ErrorKind::Other,
-                "server returned InfoResponse without an Entry",
-            )
-        })?;
-        Entry::try_from(proto_entry)
-    }
-
-    async fn cat_file(&self, path: &str, range: ByteRange, _opts: ReadOptions) -> Result<Bytes> {
-        let mut client = self.client.clone();
+    async fn read_bytes_with_chunk_size(
+        &self,
+        path: &str,
+        range: ByteRange,
+        chunk_size: Option<usize>,
+    ) -> Result<Bytes> {
+        let mut client = self.next_client();
+        let proto_opts = chunk_size.map(|c| ProtoReadOptions {
+            chunk_size: Some(c as u64),
+        });
         let mut stream = client
             .read(ReadRequest {
                 path: path.to_owned(),
                 range: Some(range.into()),
-                options: None,
+                options: proto_opts,
             })
             .await
             .map_err(status_to_error)?
@@ -209,6 +258,32 @@ impl FileSystem for RemoteFs {
             (None, Some(head)) => head,
             (None, None) => Bytes::new(),
         })
+    }
+}
+
+#[async_trait]
+impl FileSystem for RemoteFs {
+    async fn info(&self, path: &str) -> Result<Entry> {
+        let mut client = self.next_client();
+        let response = client
+            .info(InfoRequest {
+                path: path.to_owned(),
+            })
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+
+        let proto_entry = response.entry.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Other,
+                "server returned InfoResponse without an Entry",
+            )
+        })?;
+        Entry::try_from(proto_entry)
+    }
+
+    async fn cat_file(&self, path: &str, range: ByteRange, _opts: ReadOptions) -> Result<Bytes> {
+        self.read_bytes_with_chunk_size(path, range, None).await
     }
 
     async fn pipe_file(&self, path: &str, data: Bytes, opts: WriteOptions) -> Result<()> {
@@ -255,14 +330,14 @@ impl FileSystem for RemoteFs {
                     block_size: opts.block_size.map(|b| b as u64),
                 };
 
-                let (tx, rx) = mpsc::channel::<WriteRequest>(4);
+                let (tx, rx) = mpsc::channel::<WriteRequest>(16);
                 tx.send(WriteRequest {
                     payload: Some(Payload::Spec(spec)),
                 })
                 .await
                 .map_err(|_| Error::new(ErrorKind::Other, "failed to enqueue WriteSpec"))?;
 
-                let mut client = self.client.clone();
+                let mut client = self.next_client();
                 let task = tokio::spawn(async move {
                     client
                         .write(ReceiverStream::new(rx))
@@ -285,7 +360,7 @@ impl FileSystem for RemoteFs {
     }
 
     async fn ls(&self, path: &str, opts: ListOptions) -> Result<Vec<Entry>> {
-        let mut client = self.client.clone();
+        let mut client = self.next_client();
         let response = client
             .list(ListRequest {
                 path: path.to_owned(),
@@ -337,8 +412,10 @@ enum RemoteFileState {
         fs: RemoteFs,
         pos: u64,
         block_size: usize,
-        buffer: Bytes,
-        buffer_start: u64,
+        seeked: bool,
+        prev_read_end: Option<u64>,
+        stream: Option<Streaming<ReadResponse>>,
+        stream_chunk: Bytes,
     },
     Write {
         tx: Option<mpsc::Sender<WriteRequest>>,
@@ -367,8 +444,10 @@ impl RemoteFile {
                 fs,
                 pos: 0,
                 block_size: block_size.unwrap_or(DEFAULT_BLOCK_SIZE),
-                buffer: Bytes::new(),
-                buffer_start: 0,
+                seeked: false,
+                prev_read_end: None,
+                stream: None,
+                stream_chunk: Bytes::new(),
             },
         }
     }
@@ -441,7 +520,13 @@ impl File for RemoteFile {
         self.ensure_open()?;
         match &mut self.state {
             RemoteFileState::Read {
-                pos: cursor, stat, ..
+                pos: cursor,
+                stat,
+                seeked,
+                prev_read_end,
+                stream,
+                stream_chunk,
+                ..
             } => {
                 let (base, offset) = match pos {
                     SeekFrom::Start(offset) => (0u64, offset as i64),
@@ -454,8 +539,17 @@ impl File for RemoteFile {
                         "seek to {target} is before the start of the file"
                     )));
                 }
-                *cursor =
+                let new_pos =
                     u64::try_from(target).map_err(|_| Error::invalid_range("seek overflow"))?;
+                if new_pos != *cursor {
+                    *cursor = new_pos;
+                    *seeked = true;
+                    *prev_read_end = None;
+                    *stream = None;
+                    *stream_chunk = Bytes::new();
+                } else if new_pos > 0 && prev_read_end.is_none() {
+                    *seeked = true;
+                }
                 Ok(*cursor)
             }
             RemoteFileState::Write { .. } => Err(Error::unsupported(format!(
@@ -475,8 +569,10 @@ impl File for RemoteFile {
                 fs,
                 pos,
                 block_size,
-                buffer,
-                buffer_start,
+                seeked,
+                prev_read_end,
+                stream,
+                stream_chunk,
             } => {
                 let remaining = stat.size.saturating_sub(*pos);
                 let want = match len {
@@ -486,31 +582,114 @@ impl File for RemoteFile {
                 if want == 0 {
                     return Ok(Bytes::new());
                 }
-                let buffer_end = *buffer_start + buffer.len() as u64;
-                if *pos >= *buffer_start && *pos + want <= buffer_end {
-                    let start = (*pos - *buffer_start) as usize;
-                    let out = buffer.slice(start..start + want as usize);
-                    *pos += want;
+                let want_usize = want as usize;
+
+                let is_sequential = (*pos == 0 && !*seeked && prev_read_end.is_none())
+                    || *prev_read_end == Some(*pos)
+                    || stream.is_some();
+
+                if !is_sequential {
+                    // Rule 7 single-read isolation on the first read after a non-zero seek:
+                    // fetch the exact requested byte range `[pos, pos + want)`.
+                    let req_chunk = want_usize.max(DEFAULT_READ_CHUNK_SIZE).min(MAX_READ_CHUNK_SIZE);
+                    let bytes = fs
+                        .read_bytes_with_chunk_size(
+                            pinned_path,
+                            ByteRange::span(*pos, *pos + want),
+                            Some(req_chunk),
+                        )
+                        .await?;
+                    let out = bytes.slice(0..want_usize.min(bytes.len()));
+                    *pos += out.len() as u64;
+                    *prev_read_end = Some(*pos);
                     return Ok(out);
                 }
-                let fetch_len = if want < *block_size as u64 {
-                    (*block_size as u64).min(remaining)
-                } else {
-                    want
-                };
-                let bytes = fs
-                    .cat_file(
-                        pinned_path,
-                        ByteRange::span(*pos, *pos + fetch_len),
-                        ReadOptions::default(),
-                    )
-                    .await?;
-                let out = bytes.slice(0..(want as usize).min(bytes.len()));
-                if fetch_len > want {
-                    *buffer_start = *pos;
-                    *buffer = bytes;
+
+                if stream.is_none() {
+                    let stream_chunk_size =
+                        (*block_size).max(DEFAULT_READ_CHUNK_SIZE).min(MAX_READ_CHUNK_SIZE);
+                    let mut client = fs.next_client();
+                    let s = client
+                        .read(ReadRequest {
+                            path: pinned_path.clone(),
+                            range: Some(ByteRange::span(*pos, stat.size).into()),
+                            options: Some(ProtoReadOptions {
+                                chunk_size: Some(stream_chunk_size as u64),
+                            }),
+                        })
+                        .await
+                        .map_err(status_to_error)?
+                        .into_inner();
+                    *stream = Some(s);
                 }
+
+                // Fast path 1: satisfy directly from leftover bytes in `stream_chunk`.
+                if stream_chunk.len() >= want_usize {
+                    let out = stream_chunk.split_to(want_usize);
+                    *pos += out.len() as u64;
+                    *prev_read_end = Some(*pos);
+                    return Ok(out);
+                }
+
+                // Fast path 2: `stream_chunk` is empty and the next frame from `stream`
+                // has at least `want_usize` bytes (zero-copy `Bytes` return).
+                if stream_chunk.is_empty() {
+                    if let Some(s) = stream.as_mut() {
+                        while let Some(res) = s.next().await {
+                            let mut chunk = res.map_err(status_to_error)?.data;
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            if chunk.len() >= want_usize {
+                                let out = chunk.split_to(want_usize);
+                                *stream_chunk = chunk;
+                                *pos += out.len() as u64;
+                                *prev_read_end = Some(*pos);
+                                return Ok(out);
+                            }
+                            *stream_chunk = chunk;
+                            break;
+                        }
+                    }
+                    if stream_chunk.is_empty() {
+                        *stream = None;
+                        return Ok(Bytes::new());
+                    }
+                }
+
+                // Multi-chunk assembly when `want_usize` spans multiple frames.
+                let mut buf = BytesMut::with_capacity(want_usize);
+                buf.extend_from_slice(stream_chunk);
+                *stream_chunk = Bytes::new();
+
+                if let Some(s) = stream.as_mut() {
+                    while buf.len() < want_usize {
+                        match s.next().await {
+                            Some(res) => {
+                                let mut chunk = res.map_err(status_to_error)?.data;
+                                if chunk.is_empty() {
+                                    continue;
+                                }
+                                let needed = want_usize - buf.len();
+                                if chunk.len() <= needed {
+                                    buf.extend_from_slice(&chunk);
+                                } else {
+                                    let head = chunk.split_to(needed);
+                                    buf.extend_from_slice(&head);
+                                    *stream_chunk = chunk;
+                                }
+                            }
+                            None => {
+                                *stream = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let out = buf.freeze();
                 *pos += out.len() as u64;
+                *prev_read_end = Some(*pos);
                 Ok(out)
             }
             RemoteFileState::Write { .. } => Err(Error::unsupported(format!(
@@ -534,10 +713,12 @@ impl File for RemoteFile {
                 if clamped.start >= clamped.end {
                     return Ok(Bytes::new());
                 }
-                fs.cat_file(
+                let span = (clamped.end - clamped.start) as usize;
+                let req_chunk = span.max(DEFAULT_READ_CHUNK_SIZE).min(MAX_READ_CHUNK_SIZE);
+                fs.read_bytes_with_chunk_size(
                     pinned_path,
                     ByteRange::span(clamped.start, clamped.end),
-                    ReadOptions::default(),
+                    Some(req_chunk),
                 )
                 .await
             }
@@ -561,7 +742,7 @@ impl File for RemoteFile {
                 };
                 let mut offset = 0;
                 while offset < data.len() {
-                    let end = (offset + DEFAULT_READ_CHUNK_SIZE).min(data.len());
+                    let end = (offset + MAX_READ_CHUNK_SIZE).min(data.len());
                     let chunk = data.slice(offset..end);
                     if sender
                         .send(WriteRequest {
@@ -610,24 +791,33 @@ impl File for RemoteFile {
         if self.closed {
             return Ok(());
         }
-        if let RemoteFileState::Write {
-            tx,
-            task,
-            size,
-            stat,
-            ..
-        } = &mut self.state
-        {
-            drop(tx.take());
-            if let Some(handle) = task.take() {
-                let resp = handle.await.map_err(|join| {
-                    Error::new(
-                        ErrorKind::Other,
-                        format!("remote write task failed: {join}"),
-                    )
-                })??;
-                *size = Some(resp.size);
-                *stat = resp.stat.map(ObjectStat::from);
+        match &mut self.state {
+            RemoteFileState::Read {
+                stream,
+                stream_chunk,
+                ..
+            } => {
+                *stream = None;
+                *stream_chunk = Bytes::new();
+            }
+            RemoteFileState::Write {
+                tx,
+                task,
+                size,
+                stat,
+                ..
+            } => {
+                drop(tx.take());
+                if let Some(handle) = task.take() {
+                    let resp = handle.await.map_err(|join| {
+                        Error::new(
+                            ErrorKind::Other,
+                            format!("remote write task failed: {join}"),
+                        )
+                    })??;
+                    *size = Some(resp.size);
+                    *stat = resp.stat.map(ObjectStat::from);
+                }
             }
         }
         self.closed = true;
@@ -638,11 +828,21 @@ impl File for RemoteFile {
         if self.closed {
             return Ok(());
         }
-        if let RemoteFileState::Write { tx, task, .. } = &mut self.state {
-            if let Some(handle) = task.take() {
-                handle.abort();
+        match &mut self.state {
+            RemoteFileState::Read {
+                stream,
+                stream_chunk,
+                ..
+            } => {
+                *stream = None;
+                *stream_chunk = Bytes::new();
             }
-            drop(tx.take());
+            RemoteFileState::Write { tx, task, .. } => {
+                if let Some(handle) = task.take() {
+                    handle.abort();
+                }
+                drop(tx.take());
+            }
         }
         self.closed = true;
         Ok(())
