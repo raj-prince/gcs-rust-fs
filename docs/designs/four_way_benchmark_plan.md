@@ -385,14 +385,20 @@ All changes in this repository are partitioned into three incremental, self-cont
 *   **Stack 1 (Native Rust) Live 20 GiB Benchmark on `US-WEST4` (`gs://princer-flat/bench/bench_20GB.bin`, `Transport::Http`, `ReadPattern::Auto`)**:
 
 #### Part 1: Uncached Metadata `info()` Latency (`30` Iterations)
+#### Part 1: Uncached Metadata `info()` Latency (`1T`, `30` Iterations)
 
 | Operation | Iters | Mean | Min | `p50` | `p90` | `p99` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | `GcsFs::info` (Direct Uncached HTTP) | 30 | `25.79 ms` | `20.38 ms` | **`25.27 ms`** | `33.10 ms` | `34.16 ms` |
+| `GcsFs::info` (Direct Uncached HTTP) | 30 | `28.38 ms` | `23.21 ms` | **`28.38 ms`** | `31.00 ms` | `38.53 ms` |
+| `GcsFs::info` (Direct Uncached) | 30 | `28.38 ms` | `23.21 ms` | **`28.38 ms`** | `31.00 ms` | `38.53 ms` |
 
 #### Part 2: `1 MiB` Random Read (`read_size = 1 MiB`, `io_size = 1 MiB`, `ReadPattern::Auto`)
+#### Part 2: `1 MiB` Random Read (`CachedFs` Mode 1 Default, `read_size = 1 MiB`, `io_size = 1 MiB`, `ReadPattern::Auto`)
+#### Part 2: Single-Threaded `1 MiB` Random Read (`CachedFs` Mode 1 Default, `1T`, `read_size = 1 MiB`, `io_size = 1 MiB`, `ReadPattern::Auto`)
 
 | Approach | Threads | Reads | `p50` | `p90` | `p99` | IOPS | Throughput |
+| Approach | Threads | Reads (`Total Data`) | `p50` | `p90` | `p99` | IOPS | Throughput |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | Direct `GcsFs::cat_file` (Uncached HTTP) | `1T` | 50 | `63.96 ms` | `72.24 ms` | `77.69 ms` | `16.7` | `17.54 MB/s` (`16.73 MiB/s`) |
 | `CachedFs` Mode 1 (Drop-Behind, `Auto`, `io=1MiB`) | `1T` | 50 | **`28.61 ms`** | `36.38 ms` | `46.53 ms` | **`34.4`** | **`36.10 MB/s` (`34.43 MiB/s`)** |
@@ -402,8 +408,12 @@ All changes in this repository are partitioned into three incremental, self-cont
 | `CachedFs` Mode 1 (Drop-Behind, `Auto`, `io=1MiB`) | `48T` | 480 | **`29.67 ms`** | `44.97 ms` | `66.16 ms` | **`1,163.6`** | **`1,220.16 MB/s` (`1,163.64 MiB/s`)** |
 | `CachedFs` Mode 2 (`PageCache` Cold, `Auto`, `io=1MiB`) | `48T` | 480 | `28.94 ms` | `38.68 ms` | `55.68 ms` | `1,367.2` | `1,433.63 MB/s` (`1,367.22 MiB/s`) |
 | `CachedFs` Mode 2 (`PageCache` Warm, `Auto`, `io=1MiB`) | `48T` | 480 | **`0.25 ms`** | `0.50 ms` | `0.94 ms` | `102,431.6` | `107,407.30 MB/s` (`102,431.59 MiB/s`) |
+| `CachedFs` Mode 1 (Drop-Behind, `Auto`, `io=1MiB`) | **`1T`** | `50` (`50 MiB`) | **`39.15 ms`** | `53.03 ms` | `128.24 ms` | **`23.9`** | **`25.03 MB/s` (`23.87 MiB/s`)** |
+| `CachedFs` Mode 1 (Drop-Behind, `Auto`, `io=1MiB`) | **`24T`** | `240` (`240 MiB`) | **`35.36 ms`** | `45.46 ms` | `78.90 ms` | **`545.1`** | **`571.59 MB/s` (`545.11 MiB/s`)** |
+| `CachedFs` Mode 1 (Drop-Behind, `Auto`, `io=1MiB`) | **`48T`** | `480` (`480 MiB`) | **`31.54 ms`** | `42.61 ms` | `65.13 ms` | **`765.1`** | **`802.24 MB/s` (`765.08 MiB/s`)** |
 
 #### Part 3: Sequential Read (`1T = 20 GiB`, `48T = 48 × 20 GiB = 960 GiB`, `ReadPattern::Auto`)
+#### Part 3: Sequential Read (`CachedFs` Mode 1 Default, `ReadPattern::Auto` — `1T = 20 GiB`, `24T = 480 GiB`, `48T = 960 GiB`)
 
 | Approach | Threads | Total Data | `read_size` | `io_size` | `max_folio` | Wall Time | Chunk `p50` | Chunk `p90` | Throughput |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -412,6 +422,16 @@ All changes in this repository are partitioned into three incremental, self-cont
 | `CachedFs` Mode 1 (`Auto`) | `1T` | `20 GiB` | `8 MiB` | `16 MiB` | `16 MiB` | **`4.88 s`** | `0.00 ms` | `0.04 ms` | **`4,401.46 MB/s` (`4,197.56 MiB/s`)** |
 | Direct `GcsFs` HTTP (Uncached) | `48T` | `960 GiB` (`48 × 20 GiB`) | `8 MiB` | — | — | `150.92 s` | `51.63 ms` | `67.97 ms` | `6,830.02 MB/s` (`6,513.61 MiB/s`) |
 | `CachedFs` Mode 1 (`Auto`) | `48T` | `960 GiB` (`48 × 20 GiB`) | `8 MiB` | `16 MiB` | `16 MiB` | **`48.48 s`** | `0.00 ms` | `53.20 ms` | **`21,261.74 MB/s` (`20,276.78 MiB/s`)** |
+| `CachedFs` Mode 1 (`Auto`) | **`1T`** | `20 GiB` (`1 × 20 GiB`) | `8 MiB` | `16 MiB` | `16 MiB` | **`5.23 s`** | **`0.00 ms`** | `0.11 ms` | **`4,106.42 MB/s` (`3,916.18 MiB/s`)** |
+| `CachedFs` Mode 1 (`Auto`) | **`24T`** | `480 GiB` (`24 × 20 GiB`) | `8 MiB` | `16 MiB` | `16 MiB` | **`33.03 s`** | **`0.00 ms`** | `49.88 ms` | **`15,604.48 MB/s` (`14,881.59 MiB/s`)** |
+| `CachedFs` Mode 1 (`Auto`) | **`48T`** | `960 GiB` (`48 × 20 GiB`) | `8 MiB` | `16 MiB` | `16 MiB` | **`49.14 s`** | **`0.00 ms`** | `75.63 ms` | **`20,976.12 MB/s` (`20,004.39 MiB/s`)** |
+
+#### Part 4: Single-Threaded `200 MiB` Write (`1T`, `5` Iterations)
+
+| Approach | Threads | Iters | Mean | `p50` | `p90` | Throughput (at `p50`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `CachedFs::open(write)` + `write(8 MiB)` + `close` (`200 MiB`) | **`1T`** | `5` | `2.14 s` | **`2.14 s`** | `2.17 s` | **`97.88 MB/s` (`93.34 MiB/s`)** |
+| `CachedFs::pipe_file` (One-Shot `200 MiB` Upload) | **`1T`** | `5` | `1.34 s` | **`1.34 s`** | `1.71 s` | **`156.46 MB/s` (`149.21 MiB/s`)** |
 
 --------------------------------------------------------------------------------
 

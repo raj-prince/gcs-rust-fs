@@ -549,6 +549,9 @@ async fn test_12_handle_semaphore_zero_copy_and_post_seek_ramp() {
 
     // 1. Seek to 8 MiB and issue a large (>= io_size = 4 MiB) read under ReadPattern::Auto:
     //    Should trigger initial Rule 1 ramp (8 MiB = 2x request) instead of Rule 7 single-read isolation.
+    // 1. Seek to 8 MiB and issue two consecutive 4 MiB reads under ReadPattern::Auto:
+    //    First read after seek (8..12 MiB) is isolated via Rule 7; second consecutive read
+    //    (12..16 MiB) is detected as sequential (`is_sequential == true`) and ramps the window.
     let mut file = fs
         .open("bucket/sliding.bin", OpenOptions::read())
         .await
@@ -556,24 +559,40 @@ async fn test_12_handle_semaphore_zero_copy_and_post_seek_ramp() {
     file.seek(SeekFrom::Start(8 * 1024 * 1024)).unwrap();
     let chunk = file.read(Some(4 * 1024 * 1024)).await.unwrap();
     assert_eq!(chunk.len(), 4 * 1024 * 1024);
+    let chunk1 = file.read(Some(4 * 1024 * 1024)).await.unwrap();
+    assert_eq!(chunk1.len(), 4 * 1024 * 1024);
     assert_eq!(
         &chunk[..],
+        &chunk1[..],
         &raw_data[8 * 1024 * 1024..12 * 1024 * 1024]
     );
 
     // Wait briefly for the second folio in the ramped window to complete
+    let chunk2 = file.read(Some(4 * 1024 * 1024)).await.unwrap();
+    assert_eq!(chunk2.len(), 4 * 1024 * 1024);
+    assert_eq!(
+        &chunk2[..],
+        &raw_data[12 * 1024 * 1024..16 * 1024 * 1024]
+    );
+
+    // Wait briefly for the second folio in the ramped window (16..20 MiB) to complete
     tokio::time::sleep(Duration::from_millis(20)).await;
     let fetched_after_large_seek = metrics.read_range_bytes.load(Ordering::Relaxed);
+    let fetched_after_seq = metrics.read_range_bytes.load(Ordering::Relaxed);
     assert!(
         fetched_after_large_seek >= 8 * 1024 * 1024,
         "Large post-seek read (>= io_size) should ramp readahead window: fetched {fetched_after_large_seek}"
+        fetched_after_seq >= 12 * 1024 * 1024,
+        "Second consecutive post-seek read should ramp readahead window: fetched {fetched_after_seq}"
     );
 
     // 2. Read the next 2 MiB (entirely inside the 12..16 MiB folio) via zero-copy fast path
+    // 2. Read the next 2 MiB (entirely inside the prefetched 16..20 MiB folio) via zero-copy fast path
     let sub_slice = file.read(Some(2 * 1024 * 1024)).await.unwrap();
     assert_eq!(sub_slice.len(), 2 * 1024 * 1024);
     assert_eq!(
         &sub_slice[..],
         &raw_data[12 * 1024 * 1024..14 * 1024 * 1024]
+        &raw_data[16 * 1024 * 1024..18 * 1024 * 1024]
     );
 }

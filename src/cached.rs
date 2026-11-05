@@ -45,7 +45,8 @@ pub struct CacheConfig {
     /// Let a complete `find` fill the listing of every directory it visits.
     pub populate_from_find: bool,
     /// Data caching and asynchronous readahead configuration.
-    /// `None` = data operations are passed through unbuffered and unreadahead.
+    /// Defaults to `Some(DataConfig::readahead_only())` (Mode 1 drop-behind readahead with `ReadPattern::Auto`).
+    /// Set to `None` to pass data operations through unbuffered and without readahead.
     pub data: Option<DataConfig>,
 }
 
@@ -56,7 +57,7 @@ impl Default for CacheConfig {
             max_dirs: None,
             negative: false,
             populate_from_find: true,
-            data: None,
+            data: Some(DataConfig::readahead_only()),
         }
     }
 }
