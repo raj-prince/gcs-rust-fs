@@ -36,12 +36,17 @@ use crate::stat::ObjectStat;
 /// project, in order.
 pub const PROJECT_ENV_VARS: [&str; 2] = ["GCS_RUST_FS_PROJECT", "GOOGLE_CLOUD_PROJECT"];
 
+/// Environment variable consulted by [`GcsFsBuilder::from_env`] for the HTTP
+/// client pool size.
+pub const HTTP_POOL_SIZE_ENV_VAR: &str = "GCS_RUST_FS_HTTP_POOL_SIZE";
+
 /// Builder for [`GcsFs`].
 #[derive(Clone, Debug, Default)]
 pub struct GcsFsBuilder {
     transport: Option<Transport>,
     endpoint: Option<String>,
     grpc_subchannel_count: Option<usize>,
+    http_pool_size: Option<usize>,
     project: Option<String>,
     bucket_kinds: HashMap<String, BucketKind>,
     finalize_on_close: bool,
@@ -74,6 +79,14 @@ impl GcsFsBuilder {
         self
     }
 
+    /// Number of striped HTTP `Storage` client instances used for
+    /// [`Transport::Http`] range reads (default: `16` when [`Transport::Http`]
+    /// is selected).
+    pub fn http_pool_size(mut self, count: usize) -> Self {
+        self.http_pool_size = Some(count);
+        self
+    }
+
     /// The project that owns the buckets listed by `ls("")` and created by
     /// `mkdir("bucket")`. Not needed for anything else.
     pub fn project(mut self, project: impl Into<String>) -> Self {
@@ -100,10 +113,30 @@ impl GcsFsBuilder {
 
     /// Fill unset options from the environment: the transport from
     /// [`Transport::ENV_VAR`] and the project from [`PROJECT_ENV_VARS`].
+    /// [`Transport::ENV_VAR`], the HTTP pool size from
+    /// [`HTTP_POOL_SIZE_ENV_VAR`], and the project from [`PROJECT_ENV_VARS`].
     /// Explicitly set options take precedence.
     pub fn from_env(mut self) -> Result<Self> {
         if self.transport.is_none() {
             self.transport = Some(Transport::from_env()?);
+        }
+        if self.http_pool_size.is_none() {
+            if let Ok(raw) = std::env::var(HTTP_POOL_SIZE_ENV_VAR) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    let count = trimmed.parse::<usize>().map_err(|_| {
+                        Error::invalid_config(format!(
+                            "invalid {HTTP_POOL_SIZE_ENV_VAR} {trimmed:?}: expected positive integer"
+                        ))
+                    })?;
+                    if count == 0 {
+                        return Err(Error::invalid_config(format!(
+                            "invalid {HTTP_POOL_SIZE_ENV_VAR} {trimmed:?}: must be at least 1"
+                        )));
+                    }
+                    self.http_pool_size = Some(count);
+                }
+            }
         }
         if self.project.is_none() {
             self.project = PROJECT_ENV_VARS
@@ -117,10 +150,16 @@ impl GcsFsBuilder {
     /// Connect to Cloud Storage. Credentials are discovered via
     /// [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials).
     pub async fn build(self) -> Result<GcsFs> {
+        if matches!(self.http_pool_size, Some(0)) {
+            return Err(Error::invalid_config(
+                "http_pool_size must be at least 1",
+            ));
+        }
         let backend = Backend::connect(BackendOptions {
             transport: self.transport.unwrap_or_default(),
             endpoint: self.endpoint,
             grpc_subchannel_count: self.grpc_subchannel_count,
+            http_pool_size: self.http_pool_size,
             project: self.project,
             bucket_kinds: self.bucket_kinds,
             finalize_on_close: self.finalize_on_close,

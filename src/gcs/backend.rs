@@ -14,9 +14,11 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
+use futures_util::future::try_join_all;
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model::Object;
 use google_cloud_storage::model_ext::ReadRange;
@@ -98,6 +100,7 @@ pub(crate) struct BackendOptions {
     pub(crate) transport: Transport,
     pub(crate) endpoint: Option<String>,
     pub(crate) grpc_subchannel_count: Option<usize>,
+    pub(crate) http_pool_size: Option<usize>,
     pub(crate) project: Option<String>,
     pub(crate) bucket_kinds: HashMap<String, BucketKind>,
     pub(crate) finalize_on_close: bool,
@@ -108,7 +111,8 @@ pub(crate) struct BackendOptions {
 /// and the bucket-kind cache is shared.
 #[derive(Clone, Debug)]
 pub(crate) struct Backend {
-    storage: Storage,
+    storage_pool: Arc<Vec<Storage>>,
+    next_http_client: Arc<AtomicUsize>,
     control: StorageControl,
     transport: Transport,
     project: Option<String>,
@@ -122,27 +126,43 @@ pub(crate) struct Backend {
 impl Backend {
     /// Build both SDK clients using Application Default Credentials.
     pub(crate) async fn connect(options: BackendOptions) -> Result<Self> {
-        let mut storage = Storage::builder();
+        let pool_size = options
+            .http_pool_size
+            .unwrap_or(match options.transport {
+                Transport::Http => 16,
+                Transport::Grpc => 1,
+            })
+            .max(1);
         let mut control = StorageControl::builder();
         if let Some(endpoint) = &options.endpoint {
-            storage = storage.with_endpoint(endpoint.clone());
             control = control.with_endpoint(endpoint.clone());
-        }
-        if let Some(count) = options.grpc_subchannel_count {
-            storage = storage.with_grpc_subchannel_count(count);
         }
         debug!(
             transport = %options.transport,
+            http_pool_size = pool_size,
             endpoint = ?options.endpoint,
             project = ?options.project,
             "connecting storage clients"
         );
-        let (storage, control) = tokio::try_join!(
-            async { storage.build().await.map_err(Error::client_init) },
+        let endpoint_ref = options.endpoint.as_ref();
+        let grpc_subchannel_count = options.grpc_subchannel_count;
+        let storage_futs = (0..pool_size).map(|_| async move {
+            let mut storage = Storage::builder();
+            if let Some(endpoint) = endpoint_ref {
+                storage = storage.with_endpoint(endpoint.clone());
+            }
+            if let Some(count) = grpc_subchannel_count {
+                storage = storage.with_grpc_subchannel_count(count);
+            }
+            storage.build().await.map_err(Error::client_init)
+        });
+        let (storage_pool, control) = tokio::try_join!(
+            try_join_all(storage_futs),
             async { control.build().await.map_err(Error::client_init) },
         )?;
         Ok(Self {
-            storage,
+            storage_pool: Arc::new(storage_pool),
+            next_http_client: Arc::new(AtomicUsize::new(0)),
             control,
             transport: options.transport,
             project: options.project,
@@ -152,7 +172,7 @@ impl Backend {
     }
 
     pub(crate) fn storage(&self) -> &Storage {
-        &self.storage
+        &self.storage_pool[0]
     }
 
     pub(crate) fn control(&self) -> &StorageControl {
@@ -288,7 +308,7 @@ impl Backend {
 
     async fn read_range_grpc(&self, path: &GcsPath, range: ReadRange) -> Result<Reader> {
         let mut request = self
-            .storage
+            .storage()
             .open_object(path.bucket_resource(), path.object());
         if let Some(generation) = path.generation() {
             request = request.set_generation(generation);
@@ -303,8 +323,8 @@ impl Backend {
     }
 
     async fn read_range_http(&self, path: &GcsPath, range: ReadRange) -> Result<Reader> {
-        let mut request = self
-            .storage
+        let idx = self.next_http_client.fetch_add(1, Ordering::Relaxed) % self.storage_pool.len();
+        let mut request = self.storage_pool[idx]
             .read_object(path.bucket_resource(), path.object())
             .set_read_range(range);
         if let Some(generation) = path.generation() {
@@ -342,7 +362,7 @@ impl Backend {
 
     async fn open_grpc(&self, path: &GcsPath) -> Result<(Object, ReadHandle)> {
         let mut request = self
-            .storage
+            .storage()
             .open_object(path.bucket_resource(), path.object());
         if let Some(generation) = path.generation() {
             request = request.set_generation(generation);

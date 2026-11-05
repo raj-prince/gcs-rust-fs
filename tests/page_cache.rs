@@ -516,3 +516,64 @@ async fn test_11_read_pattern_hints() {
         "Random pattern should only issue 1 exact single-page fetch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 12: Per-Handle Semaphore Pacing, Zero-Copy Slice, & Post-Seek Streaming Ramp
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_12_handle_semaphore_zero_copy_and_post_seek_ramp() {
+    let size = 32 * 1024 * 1024; // 32 MiB
+    let raw_data = create_synthetic_data(size);
+    let mem = create_test_memfs().await;
+    mem.pipe_file(
+        "bucket/sliding.bin",
+        raw_data.clone(),
+        gcs_rust_fs::WriteOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let (spy, metrics) = SpyFs::new(mem);
+    let mut ra_cfg = ReadaheadConfig::default();
+    ra_cfg.page_size = 256 * 1024;
+    ra_cfg.io_size = 4 * 1024 * 1024; // 4 MiB folios
+    ra_cfg.max_folio_size = 4 * 1024 * 1024;
+    ra_cfg.max_readahead = 16 * 1024 * 1024; // 4 folios per window
+    ra_cfg.max_inflight = 2; // Cap per-handle concurrent folios to 2
+
+    let cfg = CacheConfig::default().with_data(DataConfig {
+        readahead: ra_cfg,
+        cache: None,
+    });
+    let fs = CachedFs::new(spy, cfg);
+
+    // 1. Seek to 8 MiB and issue a large (>= io_size = 4 MiB) read under ReadPattern::Auto:
+    //    Should trigger initial Rule 1 ramp (8 MiB = 2x request) instead of Rule 7 single-read isolation.
+    let mut file = fs
+        .open("bucket/sliding.bin", OpenOptions::read())
+        .await
+        .unwrap();
+    file.seek(SeekFrom::Start(8 * 1024 * 1024)).unwrap();
+    let chunk = file.read(Some(4 * 1024 * 1024)).await.unwrap();
+    assert_eq!(chunk.len(), 4 * 1024 * 1024);
+    assert_eq!(
+        &chunk[..],
+        &raw_data[8 * 1024 * 1024..12 * 1024 * 1024]
+    );
+
+    // Wait briefly for the second folio in the ramped window to complete
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let fetched_after_large_seek = metrics.read_range_bytes.load(Ordering::Relaxed);
+    assert!(
+        fetched_after_large_seek >= 8 * 1024 * 1024,
+        "Large post-seek read (>= io_size) should ramp readahead window: fetched {fetched_after_large_seek}"
+    );
+
+    // 2. Read the next 2 MiB (entirely inside the 12..16 MiB folio) via zero-copy fast path
+    let sub_slice = file.read(Some(2 * 1024 * 1024)).await.unwrap();
+    assert_eq!(sub_slice.len(), 2 * 1024 * 1024);
+    assert_eq!(
+        &sub_slice[..],
+        &raw_data[12 * 1024 * 1024..14 * 1024 * 1024]
+    );
+}

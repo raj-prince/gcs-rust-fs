@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gcs_rust_fs::{
-    CacheConfig, CachedFs, Error, FileSystem, FileSystemRpcService, GcsFs, Result, Transport,
+    CacheConfig, CachedFs, DataConfig, Error, FileSystem, FileSystemRpcService, GcsFs,
+    PageCacheConfig, ReadaheadConfig, Result, Transport,
 };
 
 const DEFAULT_UDS_PATH: &str = "/var/run/gcsfs/sidecar.sock";
@@ -23,6 +24,9 @@ struct SidecarArgs {
     project: Option<String>,
     mode: Option<u32>,
     cache: bool,
+    readahead: bool,
+    page_cache_mb: Option<usize>,
+    http_pool_size: Option<usize>,
 }
 
 impl SidecarArgs {
@@ -40,6 +44,9 @@ impl SidecarArgs {
         let mut project: Option<String> = None;
         let mut mode: Option<u32> = Some(0o666);
         let mut cache = false;
+        let mut readahead = false;
+        let mut page_cache_mb: Option<usize> = None;
+        let mut http_pool_size: Option<usize> = None;
 
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -106,9 +113,44 @@ impl SidecarArgs {
                 "--cache" => {
                     cache = true;
                 }
+                "--readahead" => {
+                    readahead = true;
+                }
+                "--page-cache-mb" => {
+                    let val = iter.next().ok_or_else(|| {
+                        Error::new(
+                            gcs_rust_fs::ErrorKind::InvalidConfig,
+                            "--page-cache-mb requires a number of MiB",
+                        )
+                    })?;
+                    let mb: usize = val.parse().map_err(|e| {
+                        Error::with_source(
+                            gcs_rust_fs::ErrorKind::InvalidConfig,
+                            format!("invalid --page-cache-mb {val:?}"),
+                            e,
+                        )
+                    })?;
+                    page_cache_mb = Some(mb);
+                }
+                "--http-pool-size" => {
+                    let val = iter.next().ok_or_else(|| {
+                        Error::new(
+                            gcs_rust_fs::ErrorKind::InvalidConfig,
+                            "--http-pool-size requires a positive integer",
+                        )
+                    })?;
+                    let n: usize = val.parse().map_err(|e| {
+                        Error::with_source(
+                            gcs_rust_fs::ErrorKind::InvalidConfig,
+                            format!("invalid --http-pool-size {val:?}"),
+                            e,
+                        )
+                    })?;
+                    http_pool_size = Some(n);
+                }
                 "--help" | "-h" => {
                     eprintln!(
-                        "Usage: gcsfs-sidecar [--uds <PATH>] [--mode <OCTAL>] [--tcp <HOST:PORT>] [--transport http|grpc] [--endpoint <URL>] [--project <PROJECT>] [--cache]"
+                        "Usage: gcsfs-sidecar [--uds <PATH>] [--mode <OCTAL>] [--tcp <HOST:PORT>] [--transport http|grpc] [--endpoint <URL>] [--project <PROJECT>] [--cache] [--readahead] [--page-cache-mb <MB>] [--http-pool-size <N>]"
                     );
                     std::process::exit(0);
                 }
@@ -133,6 +175,9 @@ impl SidecarArgs {
             project,
             mode,
             cache,
+            readahead,
+            page_cache_mb,
+            http_pool_size,
         })
     }
 }
@@ -171,10 +216,29 @@ async fn main() -> Result<()> {
     if let Some(proj) = args.project {
         builder = builder.project(proj);
     }
+    if let Some(n) = args.http_pool_size {
+        builder = builder.http_pool_size(n);
+    }
 
     let gcs = builder.build().await?;
-    let fs: Arc<dyn FileSystem> = if args.cache {
-        Arc::new(CachedFs::new(gcs, CacheConfig::default()))
+    let fs: Arc<dyn FileSystem> = if args.cache || args.readahead || args.page_cache_mb.is_some() {
+        let mut cfg = CacheConfig::default();
+        if args.readahead || args.page_cache_mb.is_some() {
+            cfg.data = Some(DataConfig {
+                readahead: ReadaheadConfig {
+                    page_size: 256 * 1024,
+                    io_size: 16 * 1024 * 1024,
+                    max_folio_size: 16 * 1024 * 1024,
+                    max_readahead: if args.readahead { 256 * 1024 * 1024 } else { 0 },
+                    max_inflight: 16,
+                    max_inflight_bytes: 4 * 1024 * 1024 * 1024,
+                },
+                cache: args.page_cache_mb.map(|mb| PageCacheConfig {
+                    capacity: mb * 1024 * 1024,
+                }),
+            });
+        }
+        Arc::new(CachedFs::new(gcs, cfg))
     } else {
         Arc::new(gcs)
     };

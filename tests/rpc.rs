@@ -11,8 +11,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::MemoryFs;
 use gcs_rust_fs::{
-    ByteRange, EntryKind, ErrorKind, FileSystem, FileSystemRpcService, ListOptions, OpenOptions,
-    ReadOptions, RemoteFs, WriteMode, WriteOptions,
+    ByteRange, CacheConfig, CachedFs, DataConfig, EntryKind, ErrorKind, FileSystem,
+    FileSystemRpcService, ListOptions, OpenOptions, PageCacheConfig, ReadOptions, ReadaheadConfig,
+    RemoteFs, WriteMode, WriteOptions,
 };
 use tokio::sync::oneshot;
 
@@ -419,5 +420,99 @@ async fn multi_uds_served_simultaneously_by_one_server() {
     let _ = handle.await;
     let _ = std::fs::remove_file(&sock1);
     let _ = std::fs::remove_file(&sock2);
+}
+
+#[tokio::test]
+async fn cached_readahead_sidecar_serves_bounded_random_and_large_sequential_reads() {
+    // Arrange: 20 MiB deterministic payload served through CachedFs + ReadaheadConfig
+    let size = 20 * 1024 * 1024;
+    let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let mem = MemoryFs::with_files(&[("my-bucket/seed", "x")]);
+    mem.pipe_file(
+        "my-bucket/seq20m.bin",
+        Bytes::from(payload.clone()),
+        WriteOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let cfg = CacheConfig {
+        data: Some(DataConfig {
+            readahead: ReadaheadConfig {
+                page_size: 256 * 1024,
+                io_size: 4 * 1024 * 1024,
+                max_folio_size: 4 * 1024 * 1024,
+                max_readahead: 16 * 1024 * 1024,
+                max_inflight: 4,
+                max_inflight_bytes: 32 * 1024 * 1024,
+            },
+            cache: Some(PageCacheConfig {
+                capacity: 32 * 1024 * 1024,
+            }),
+        }),
+        ..Default::default()
+    };
+    let cached_fs: Arc<dyn FileSystem> = Arc::new(CachedFs::new(mem, cfg));
+
+    let id = SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sock_path = std::env::temp_dir().join(format!(
+        "gcs-rust-fs-test-ra-{}-{id}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let (tx, rx) = oneshot::channel::<()>();
+    let service = FileSystemRpcService::new(cached_fs);
+    let server_sock = sock_path.clone();
+    let handle = tokio::spawn(async move {
+        let _ = service
+            .serve_uds_with_shutdown(&server_sock, async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+
+    let mut client = None;
+    for _ in 0..50 {
+        if sock_path.exists() {
+            if let Ok(c) = RemoteFs::connect_uds(&sock_path).await {
+                client = Some(c);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let client = client.expect("failed to connect to cached readahead UDS server");
+
+    // Act 1: 1 MiB bounded random read (`span <= chunk_size` fast path)
+    let start_1m = 3 * 1024 * 1024;
+    let end_1m = 4 * 1024 * 1024;
+    let slice_1m = client
+        .cat_file(
+            "my-bucket/seq20m.bin",
+            ByteRange::span(start_1m as u64, end_1m as u64),
+            ReadOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(slice_1m.as_ref(), &payload[start_1m..end_1m]);
+
+    // Act 2: >= 16 MiB sequential read (`ReadPattern::Sequential` streaming path)
+    let start_16m = 2 * 1024 * 1024;
+    let end_16m = 18 * 1024 * 1024;
+    let slice_16m = client
+        .cat_file(
+            "my-bucket/seq20m.bin",
+            ByteRange::span(start_16m as u64, end_16m as u64),
+            ReadOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(slice_16m.as_ref(), &payload[start_16m..end_16m]);
+
+    // Cleanup
+    let _ = tx.send(());
+    let _ = handle.await;
+    let _ = std::fs::remove_file(&sock_path);
 }
 

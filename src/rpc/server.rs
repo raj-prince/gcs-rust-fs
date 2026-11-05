@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::error::Error;
 use crate::filesystem::FileSystem;
-use crate::options::{ListOptions, OpenOptions, WriteOptions};
+use crate::options::{ListOptions, OpenOptions, ReadOptions, ReadPattern, WriteOptions};
 use crate::range::ByteRange;
 use crate::rpc::convert::{error_to_status, ERROR_KIND_HEADER};
 use crate::rpc::proto::file_system_service_server::{
@@ -242,15 +242,56 @@ impl FileSystemService for FileSystemRpcService {
         let range = req.range.map(ByteRange::from).unwrap_or(ByteRange::ALL);
         debug!(path = %req.path, ?range, chunk_size, "rpc Read");
 
+        let open_opts = match (range.start(), range.end()) {
+            (start_opt, Some(end))
+                if start_opt.unwrap_or(0) >= 0 && end >= start_opt.unwrap_or(0) =>
+            {
+                let start = start_opt.unwrap_or(0) as u64;
+                let end = end as u64;
+                let span = end.saturating_sub(start);
+                if span <= 4 * 1024 * 1024 {
+                    if span as usize <= chunk_size {
+                        let data = self
+                            .fs
+                            .cat_file(&req.path, range, ReadOptions::default())
+                            .await
+                            .map_err(error_to_status)?;
+                        let (tx, rx) = mpsc::channel(1);
+                        if !data.is_empty() {
+                            let _ = tx.try_send(Ok(ReadResponse { data }));
+                        }
+                        return Ok(Response::new(ReceiverStream::new(rx)));
+                    }
+                    OpenOptions::read()
+                        .with_block_size(chunk_size)
+                        .with_pattern(ReadPattern::Random)
+                } else if span >= 16 * 1024 * 1024 {
+                    OpenOptions::read()
+                        .with_block_size(8 * 1024 * 1024)
+                        .with_pattern(ReadPattern::Sequential)
+                } else {
+                    OpenOptions::read()
+                        .with_block_size(chunk_size)
+                        .with_pattern(ReadPattern::Auto)
+                }
+            }
+            (start_opt, None) if start_opt.unwrap_or(0) >= 0 => OpenOptions::read()
+                .with_block_size(8 * 1024 * 1024)
+                .with_pattern(ReadPattern::Sequential),
+            _ => OpenOptions::read()
+                .with_block_size(chunk_size)
+                .with_pattern(ReadPattern::Auto),
+        };
+
         // Stream chunks via `fs.open` to avoid buffering whole multi-gigabyte
         // files into memory (preventing sidecar daemon OOM).
         let mut handle = self
             .fs
-            .open(&req.path, OpenOptions::read())
+            .open(&req.path, open_opts)
             .await
             .map_err(error_to_status)?;
 
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(16);
         tokio::spawn(async move {
             let file_size = match handle.size() {
                 Some(s) => s,

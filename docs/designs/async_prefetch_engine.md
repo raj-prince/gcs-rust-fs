@@ -170,10 +170,11 @@ We port the Linux kernel v6.6 `mm/readahead.c` algorithm:
   2. The next window is submitted asynchronously in the background.
   3. The consumer continues reading the current folio without stalling.
 * **Decision Ladder**:
-  * **Initial Read (offset 0)**: Window size starts at $2 \times$ request size, clamped to `max_readahead` and file EOF.
-  * **Sequential Streak**: Window doubles geometrically ($2 \to 4 \to 8 \to 16 \to 32 \to 64\text{ MiB}$).
-  * **Marker Hit**: Submits the next window while the current window is being read.
-  * **Rule 7 (Standalone Random Read)**: If a read does not extend the previous sequential read position (`index - page(prev_pos) > 1`) and does not hit a marker or cache context, read exactly the requested extent as a single-page folio without advancing the readahead ladder.
+  * **Initial Read (offset 0 or post-`seek` streaming read `>= io_size`)**: Window size starts at $\max(2 \times \text{req\_pages},\, 2 \times \text{io\_pages},\, 8)$, clamped to `max_readahead` and file EOF, so even small `1 MiB` `read()` calls immediately fetch full `io_size` folios.
+  * **Sequential Streak**: Window doubles geometrically ($2 \to 4 \to 8 \to 16 \to 32 \to 64\text{ MiB}$) up to `max_readahead`.
+  * **Dynamic Folio Scaling (`submit_window`)**: When sequential readahead is active (`async_size > 0` in `ReadPattern::Auto` or `ReadPattern::Sequential`), each folio's size scales dynamically from `io_size` up to `max_folio_size` via `(size / max_inflight).max(io_pages).min(max_folio_pages)`, keeping `max_inflight` requests pipelined in parallel across the HTTP/2 connection pool.
+  * **Synchronous Marker Registration (`submit_async_readahead`)**: Touching a folio with `readahead_mark = true` synchronously inserts the next window's `Loading` folios into the `BTreeMap` and spawns their background fetch tasks, preventing the reader from outrunning window registration when consuming `Ready` folios in memory.
+  * **Rule 7 (Standalone Random Read)**: If a read does not extend the previous sequential read position (`index - page(prev_pos) > 1`) and is smaller than `io_size` at a non-zero offset, read only the requested extent (`async_size = 0`, bounded by `io_pages`) without advancing the readahead ladder.
 
 ### 3. Core Data Structures
 
@@ -318,9 +319,11 @@ pub struct ReadaheadFile {
     pos: u64,
     size: u64,
     closed: bool,
+    stat: Option<ObjectStat>,
     ra_state: Mutex<ReadaheadState>,
     index: Index,
     runtime: Arc<DataRuntime>,
+    handle_semaphore: Arc<Semaphore>, // Per-handle in-flight folio pacing (`max_inflight`)
 }
 
 pub struct ReadaheadState {

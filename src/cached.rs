@@ -216,6 +216,7 @@ impl PageCache {
     pub fn record_access(&self, key: &ObjectKey, first_page: u64) {
         let t = self.tick.fetch_add(1, Ordering::Relaxed);
         let mut rec = self.recency.lock().unwrap_or_else(|e| e.into_inner());
+        rec.retain(|_, (k, p)| !(k == key && *p == first_page));
         rec.insert(t, (key.clone(), first_page));
     }
 
@@ -656,6 +657,7 @@ impl<F: FileSystem> FileSystem for CachedFs<F> {
 
             let ra_pages = runtime.config.max_readahead / runtime.config.page_size;
             let ra_state = ReadaheadState::new(opts.read_pattern, ra_pages.max(2));
+            let handle_semaphore = Arc::new(Semaphore::new(runtime.config.max_inflight.max(1)));
 
             Ok(Box::new(ReadaheadFile {
                 inner: Arc::from(inner),
@@ -668,6 +670,7 @@ impl<F: FileSystem> FileSystem for CachedFs<F> {
                 ra_state: Mutex::new(ra_state),
                 index,
                 runtime: Arc::clone(runtime),
+                handle_semaphore,
             }))
         } else {
             self.inner.open(path, opts).await
@@ -851,6 +854,7 @@ pub struct ReadaheadFile {
     ra_state: Mutex<ReadaheadState>,
     index: Index,
     runtime: Arc<DataRuntime>,
+    handle_semaphore: Arc<Semaphore>,
 }
 
 impl ReadaheadFile {
@@ -863,7 +867,7 @@ impl ReadaheadFile {
     }
 
     /// Retrieve or initiate a folio covering `page_idx`.
-    async fn get_or_fetch_folio(&self, page_idx: u64) -> Result<Arc<Folio>> {
+    async fn get_or_fetch_folio(&self, page_idx: u64, req_pages: usize) -> Result<Arc<Folio>> {
         let (existing, cancel_token) = match &self.index {
             Index::Private { folios, cancel_token } => {
                 let map = folios.lock().unwrap_or_else(|e| e.into_inner());
@@ -900,31 +904,11 @@ impl ReadaheadFile {
         };
 
         if let Some(folio) = existing {
-            let state = folio.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            match state {
-                FolioState::Ready(_) => return Ok(folio),
-                FolioState::Failed(err) => return Err(Error::new(err.kind(), err.to_string())),
-                FolioState::Loading(shared_fut) => {
-                    match shared_fut.await {
-                        Ok(b) => {
-                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
-                            *st = FolioState::Ready(b);
-                            drop(st);
-                            return Ok(folio);
-                        }
-                        Err(err) => {
-                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
-                            *st = FolioState::Failed(Arc::clone(&err));
-                            drop(st);
-                            return Err(Error::new(err.kind(), err.to_string()));
-                        }
-                    }
-                }
-            }
+            return Ok(folio);
         }
 
-        // Folio is absent: decide window size and initiate synchronous fetch (and optional readahead expansion)
-        self.ondemand_readahead(page_idx, 1).await?;
+        // Folio is absent: decide window size and initiate fetch (and optional readahead expansion)
+        self.ondemand_readahead(page_idx, req_pages)?;
 
         // After ondemand_readahead, folio should now exist in map
         let created = match &self.index {
@@ -960,49 +944,30 @@ impl ReadaheadFile {
         };
 
         if let Some(folio) = created {
-            let state = folio.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            match state {
-                FolioState::Ready(_) => Ok(folio),
-                FolioState::Failed(err) => Err(Error::new(err.kind(), err.to_string())),
-                FolioState::Loading(shared_fut) => {
-                    match shared_fut.await {
-                        Ok(b) => {
-                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
-                            *st = FolioState::Ready(b);
-                            drop(st);
-                            Ok(folio)
-                        }
-                        Err(err) => {
-                            let mut st = folio.state.lock().unwrap_or_else(|e| e.into_inner());
-                            *st = FolioState::Failed(Arc::clone(&err));
-                            drop(st);
-                            Err(Error::new(err.kind(), err.to_string()))
-                        }
-                    }
-                }
-            }
+            Ok(folio)
         } else {
             // Fallback: fetch a single folio directly
-            self.fetch_folio_range(page_idx, 1, false, cancel_token).await
+            self.fetch_folio_range(page_idx, 1, false, cancel_token)
         }
     }
 
     /// Linux v6.6 `ondemand_readahead` logic: evaluate streak, compute window, and dispatch folios.
-    async fn ondemand_readahead(&self, page_idx: u64, req_pages: usize) -> Result<()> {
+    fn ondemand_readahead(&self, page_idx: u64, req_pages: usize) -> Result<()> {
         let (start, size, async_size) = {
             let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
             let page_size = self.runtime.config.page_size;
+            let io_pages = (self.runtime.config.io_size / page_size).max(1);
             let total_pages = (self.size.saturating_add(page_size as u64 - 1) / page_size as u64).max(1);
 
             if ra.pattern == ReadPattern::Random {
-                // Random pattern: exact requested page(s) only, no ladder
+                // Random pattern: exact requested page(s) only, no speculative ladder
                 let count = req_pages.min((total_pages - page_idx) as usize);
                 (page_idx, count.max(1), 0)
             } else if ra.pattern == ReadPattern::Sequential {
                 // Sequential hint: start directly at max_readahead
                 let win = ra.ra_pages;
                 let count = win.min((total_pages - page_idx) as usize);
-                let a_size = count / 2;
+                let a_size = count;
                 ra.start = page_idx;
                 ra.size = count;
                 ra.async_size = a_size;
@@ -1016,43 +981,46 @@ impl ReadaheadFile {
                 };
 
                 let is_sequential = prev_page != u64::MAX && (page_idx == prev_page || page_idx == prev_page + 1);
+                let is_large_post_seek = ra.prev_pos == -1
+                    && req_pages.saturating_mul(page_size) >= self.runtime.config.io_size;
 
-                if !is_sequential && ra.size == 0 {
-                    // Initial read or random seek
-                    let initial_win = (req_pages * 4).max(4).min(ra.ra_pages);
+                if (page_idx == 0 || is_large_post_seek) && !is_sequential {
+                    // Rule 1: Initial read at start of file or large streaming read (>= io_size) after seek.
+                    // Ensure initial window is at least 2 * io_pages so small read() calls still fetch full io_size folios.
+                    let initial_win = (req_pages * 2).max(io_pages * 2).max(8).min(ra.ra_pages);
                     let count = initial_win.min((total_pages - page_idx) as usize);
-                    let a_size = count / 2;
+                    let a_size = count;
                     ra.start = page_idx;
                     ra.size = count;
                     ra.async_size = a_size;
                     (page_idx, count, a_size)
                 } else if is_sequential {
-                    // Geometric ramp: double previous window
+                    // Geometric ramp: double previous window (or initialize if transitioning from random seek)
                     let next_win = if ra.size == 0 {
-                        4.min(ra.ra_pages)
+                        (req_pages * 2).max(io_pages * 2).max(8).min(ra.ra_pages)
                     } else {
                         (ra.size * 2).min(ra.ra_pages)
                     };
                     let count = next_win.min((total_pages - page_idx) as usize);
-                    let a_size = count / 2;
+                    let a_size = count;
                     ra.start = page_idx;
                     ra.size = count;
                     ra.async_size = a_size;
                     (page_idx, count, a_size)
                 } else {
-                    // Rule 7 (standalone random read): read exact pages without ramp
+                    // Rule 7 (standalone random read at non-zero offset): read exact requested extent without ramp
                     let count = req_pages.min((total_pages - page_idx) as usize);
                     (page_idx, count.max(1), 0)
                 }
             }
         };
 
-        self.submit_window(start, size, async_size).await
+        self.submit_window(start, size, async_size)
     }
 
     /// Submit a window of folios starting at `start` totaling `size` pages.
     /// Sets the `readahead_mark` at `start + size - async_size`.
-    async fn submit_window(&self, start: u64, size: usize, async_size: usize) -> Result<()> {
+    fn submit_window(&self, start: u64, size: usize, async_size: usize) -> Result<()> {
         if size == 0 {
             return Ok(());
         }
@@ -1061,10 +1029,12 @@ impl ReadaheadFile {
         let io_pages = (self.runtime.config.io_size / page_size).max(1);
         let max_folio_pages = (self.runtime.config.max_folio_size / page_size).max(io_pages);
 
-        // If in sequential pattern, folio size can grow up to max_folio_size
-        let ra_pattern = self.ra_state.lock().unwrap_or_else(|e| e.into_inner()).pattern;
-        let target_folio_pages = if ra_pattern == ReadPattern::Sequential {
-            max_folio_pages
+        // When sequential readahead is active (`async_size > 0` in Auto or Sequential mode),
+        // scale folio size from `io_pages` up to `max_folio_pages` while maintaining `max_inflight`
+        // concurrent folios per window so HTTP/2 & connection pools pipeline in parallel.
+        let max_inflight = self.runtime.config.max_inflight.max(1);
+        let target_folio_pages = if async_size > 0 {
+            (size / max_inflight).max(io_pages).min(max_folio_pages)
         } else {
             io_pages
         };
@@ -1104,7 +1074,7 @@ impl ReadaheadFile {
             };
 
             if !exists {
-                self.fetch_folio_range(curr_page, folio_pages, has_marker, cancel_token.clone()).await?;
+                self.fetch_folio_range(curr_page, folio_pages, has_marker, cancel_token.clone())?;
             }
 
             curr_page += folio_pages as u64;
@@ -1114,7 +1084,7 @@ impl ReadaheadFile {
     }
 
     /// Fetch a single folio spanning `[first_page, first_page + num_pages)`.
-    async fn fetch_folio_range(
+    fn fetch_folio_range(
         &self,
         first_page: u64,
         num_pages: usize,
@@ -1138,6 +1108,10 @@ impl ReadaheadFile {
 
         let inner = Arc::clone(&self.inner);
         let semaphore = Arc::clone(&self.runtime.inflight_semaphore);
+        let handle_sem = Arc::clone(&self.handle_semaphore);
+        // Eagerly claim a per-handle permit in loop submission order when available so
+        // Window 0 folios never race with Window 1 tasks across multi-threaded workers.
+        let pre_handle_permit = handle_sem.clone().try_acquire_owned().ok();
         let cache_opt = self.runtime.cache.as_ref().map(Arc::clone);
         let obj_key = if let Index::Shared { pages, .. } = &self.index {
             Some(pages.key.clone())
@@ -1148,22 +1122,40 @@ impl ReadaheadFile {
         let fetch_len = (end_byte - start_byte) as usize;
 
         let fut = async move {
-            if let Some(ref t) = token {
-                if t.is_cancelled() {
-                    return Err(Arc::new(Error::new(crate::ErrorKind::Closed, "task cancelled")));
-                }
-            }
+            let _handle_permit = match pre_handle_permit {
+                Some(p) => p,
+                None => match &token {
+                    Some(t) => tokio::select! {
+                        biased;
+                        _ = t.cancelled() => {
+                            return Err(Arc::new(Error::new(crate::ErrorKind::Closed, "task cancelled")));
+                        }
+                        res = handle_sem.acquire_owned() => {
+                            res.map_err(|_| Arc::new(Error::new(crate::ErrorKind::Other, "semaphore closed")))?
+                        }
+                    },
+                    None => handle_sem
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Arc::new(Error::new(crate::ErrorKind::Other, "semaphore closed")))?,
+                },
+            };
 
-            let _permit = semaphore
-                .acquire_many(fetch_len.max(1) as u32)
-                .await
-                .map_err(|_| Arc::new(Error::new(crate::ErrorKind::Other, "semaphore closed")))?;
-
-            if let Some(ref t) = token {
-                if t.is_cancelled() {
-                    return Err(Arc::new(Error::new(crate::ErrorKind::Closed, "task cancelled")));
-                }
-            }
+            let _permit = match &token {
+                Some(t) => tokio::select! {
+                    biased;
+                    _ = t.cancelled() => {
+                        return Err(Arc::new(Error::new(crate::ErrorKind::Closed, "task cancelled")));
+                    }
+                    res = semaphore.acquire_many(fetch_len.max(1) as u32) => {
+                        res.map_err(|_| Arc::new(Error::new(crate::ErrorKind::Other, "semaphore closed")))?
+                    }
+                },
+                None => semaphore
+                    .acquire_many(fetch_len.max(1) as u32)
+                    .await
+                    .map_err(|_| Arc::new(Error::new(crate::ErrorKind::Other, "semaphore closed")))?,
+            };
 
             // Retry loop for transient failures (up to 3 retries)
             let mut delay = std::time::Duration::from_millis(50);
@@ -1171,7 +1163,17 @@ impl ReadaheadFile {
 
             for _ in 0..3 {
                 let range = ByteRange::from(start_byte..end_byte);
-                match inner.read_range(range).await {
+                let read_res = match &token {
+                    Some(t) => tokio::select! {
+                        biased;
+                        _ = t.cancelled() => {
+                            return Err(Arc::new(Error::new(crate::ErrorKind::Closed, "task cancelled")));
+                        }
+                        res = inner.read_range(range) => res,
+                    },
+                    None => inner.read_range(range).await,
+                };
+                match read_res {
                     Ok(bytes) => {
                         if let (Some(cache), Some(ref key)) = (&cache_opt, &obj_key) {
                             cache.add_bytes(bytes.len());
@@ -1206,35 +1208,54 @@ impl ReadaheadFile {
             state: Mutex::new(FolioState::Loading(shared_fut.clone())),
         });
 
-        self.insert_folio(first_page, Arc::clone(&folio));
+        let (folio, inserted) = self.get_or_insert_folio(first_page, folio);
 
-        // Background supervisor task to update FolioState on completion
-        let folio_clone = Arc::clone(&folio);
-        tokio::spawn(async move {
-            match shared_fut.await {
-                Ok(bytes) => {
-                    let mut st = folio_clone.state.lock().unwrap_or_else(|e| e.into_inner());
-                    *st = FolioState::Ready(bytes);
+        if inserted {
+            // Background supervisor task to update FolioState on completion
+            let folio_clone = Arc::clone(&folio);
+            tokio::spawn(async move {
+                match shared_fut.await {
+                    Ok(bytes) => {
+                        let mut st = folio_clone.state.lock().unwrap_or_else(|e| e.into_inner());
+                        *st = FolioState::Ready(bytes);
+                    }
+                    Err(err) => {
+                        let mut st = folio_clone.state.lock().unwrap_or_else(|e| e.into_inner());
+                        *st = FolioState::Failed(err);
+                    }
                 }
-                Err(err) => {
-                    let mut st = folio_clone.state.lock().unwrap_or_else(|e| e.into_inner());
-                    *st = FolioState::Failed(err);
-                }
-            }
-        });
+            });
+        }
 
         Ok(folio)
     }
 
     fn insert_folio(&self, first_page: u64, folio: Arc<Folio>) {
+        let _ = self.get_or_insert_folio(first_page, folio);
+    }
+
+    fn get_or_insert_folio(&self, first_page: u64, folio: Arc<Folio>) -> (Arc<Folio>, bool) {
         match &self.index {
             Index::Private { folios, .. } => {
                 let mut map = folios.lock().unwrap_or_else(|e| e.into_inner());
-                map.insert(first_page, folio);
+                if let Some(existing) = map.get(&first_page) {
+                    (Arc::clone(existing), false)
+                } else {
+                    map.insert(first_page, Arc::clone(&folio));
+                    (folio, true)
+                }
             }
             Index::Shared { pages, .. } => {
                 let mut map = pages.folios.lock().unwrap_or_else(|e| e.into_inner());
-                map.insert(first_page, folio);
+                if let Some(existing) = map.get(&first_page) {
+                    if folio.readahead_mark.load(Ordering::Relaxed) {
+                        existing.readahead_mark.store(true, Ordering::Relaxed);
+                    }
+                    (Arc::clone(existing), false)
+                } else {
+                    map.insert(first_page, Arc::clone(&folio));
+                    (folio, true)
+                }
             }
         }
     }
@@ -1251,9 +1272,9 @@ impl ReadaheadFile {
                 return;
             }
 
-            let next_win = (ra.size * 2).min(ra.ra_pages).max(4);
+            let next_win = (ra.size * 2).min(ra.ra_pages).max(8);
             let count = next_win.min((total_pages - next_start) as usize);
-            let a_size = count / 2;
+            let a_size = count;
 
             ra.start = next_start;
             ra.size = count;
@@ -1261,39 +1282,10 @@ impl ReadaheadFile {
             (next_start, count, a_size)
         };
 
-        // Spawn async window submission
-        let file = Arc::new(self.clone_handle());
-        tokio::spawn(async move {
-            let _ = file.submit_window(start, size, async_size).await;
-        });
-    }
-
-    fn clone_handle(&self) -> Self {
-        let ra_st = {
-            let ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
-            ReadaheadState::new(ra.pattern, ra.ra_pages)
-        };
-        Self {
-            inner: Arc::clone(&self.inner),
-            path: self.path.clone(),
-            pos: self.pos,
-            size: self.size,
-            closed: self.closed,
-            is_clone: true,
-            stat: self.stat.clone(),
-            ra_state: Mutex::new(ra_st),
-            index: match &self.index {
-                Index::Private { folios, cancel_token } => Index::Private {
-                    folios: Arc::clone(folios),
-                    cancel_token: Arc::clone(cancel_token),
-                },
-                Index::Shared { pages, cache } => Index::Shared {
-                    pages: Arc::clone(pages),
-                    cache: Arc::clone(cache),
-                },
-            },
-            runtime: Arc::clone(&self.runtime),
-        }
+        // Submit the next window synchronously: this immediately inserts the `Loading` folios
+        // into `self.index` and spawns their background fetch tasks so the reader never misses
+        // the window even when slicing through already-`Ready` folios without yielding.
+        let _ = self.submit_window(start, size, async_size);
     }
 }
 
@@ -1362,6 +1354,8 @@ impl File for ReadaheadFile {
                 let mut token_guard = cancel_token.lock().unwrap_or_else(|e| e.into_inner());
                 token_guard.cancel();
                 *token_guard = CancellationToken::new();
+                self.handle_semaphore =
+                    Arc::new(Semaphore::new(self.runtime.config.max_inflight.max(1)));
 
                 let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
                 ra.reset();
@@ -1388,11 +1382,13 @@ impl File for ReadaheadFile {
         }
 
         let page_size = self.runtime.config.page_size;
-        let mut buf = BytesMut::with_capacity(target_len);
+        let mut buf = BytesMut::new();
 
         while buf.len() < target_len && self.pos < self.size {
             let page_idx = self.pos / page_size as u64;
-            let folio = self.get_or_fetch_folio(page_idx).await?;
+            let rem_bytes = target_len - buf.len();
+            let req_pages = ((rem_bytes + page_size - 1) / page_size).max(1);
+            let folio = self.get_or_fetch_folio(page_idx, req_pages).await?;
 
             if folio.readahead_mark.swap(false, Ordering::Relaxed) {
                 self.submit_async_readahead();
@@ -1424,6 +1420,26 @@ impl File for ReadaheadFile {
             }
 
             let avail = folio_data.len() - offset_in_folio;
+            // Zero-copy fast path: when the entire requested read is satisfied by the first folio,
+            // return a reference-counted slice without allocating a BytesMut or copying memory.
+            if buf.is_empty() && avail >= target_len {
+                let out = folio_data.slice(offset_in_folio..offset_in_folio + target_len);
+                self.pos += target_len as u64;
+                {
+                    let mut ra = self.ra_state.lock().unwrap_or_else(|e| e.into_inner());
+                    ra.prev_pos = self.pos as i64;
+                }
+                if let Index::Private { folios, .. } = &self.index {
+                    let current_page = self.pos / page_size as u64;
+                    let mut map = folios.lock().unwrap_or_else(|e| e.into_inner());
+                    map.retain(|&start_page, f| start_page + (f.num_pages as u64) > current_page);
+                }
+                return Ok(out);
+            }
+
+            if buf.capacity() == 0 {
+                buf.reserve(target_len);
+            }
             let take = avail.min(target_len - buf.len());
             buf.extend_from_slice(&folio_data[offset_in_folio..offset_in_folio + take]);
             self.pos += take as u64;
@@ -1490,7 +1506,9 @@ impl File for ReadaheadFile {
 
         while cursor < clamped.end {
             let p = cursor / page_size as u64;
-            let folio = self.get_or_fetch_folio(p).await?;
+            let rem_bytes = (clamped.end - cursor) as usize;
+            let req_pages = ((rem_bytes + page_size - 1) / page_size).max(1);
+            let folio = self.get_or_fetch_folio(p, req_pages).await?;
 
             let folio_data = {
                 let st = folio.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
