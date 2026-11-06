@@ -5,6 +5,7 @@ package gcsfs.v1;
 // Sidecar file-system service backed by `gcs-rust-fs`.
 //
 // Phase 1 exposes `Info`, `Read`, and `Write`. The sidecar defaults its
+// Phase 1 exposes `Info`, `List`, `Read`, and `Write`. The sidecar defaults its
 // Google Cloud Storage data path to `Transport::Http` (JSON API with `Range`
 // headers and resumable uploads) while communicating with local `gcsfs`
 // clients over a Unix Domain Socket (or TCP loopback).

@@ -351,8 +351,11 @@ struct Counters {
 ///   and again at `close`.
 /// * Listings with [`ListOptions::versions`] and paths carrying a
 ///   `#<generation>` suffix bypass the cache; [`ListOptions::refresh`] skips
-///   the lookup and replaces the stored listing; data (`cat_file`, `open` for
-///   reading, `get_file`) is never cached.
+///   the lookup and replaces the stored listing; `open` for reading wraps the
+///   handle in [`ReadaheadFile`] when [`CacheConfig::data`] is `Some` (Mode 1
+///   drop-behind readahead by default, or Mode 2 shared [`PageCache`] when
+///   configured), while one-shot reads (`cat_file`, `get_file`) bypass the
+///   page cache unless routed through `open`.
 ///
 /// The cache is exact as long as this client is the only writer between
 /// listings; other writers are reconciled by [`CacheConfig::ttl`],

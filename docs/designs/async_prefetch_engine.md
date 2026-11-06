@@ -8,17 +8,17 @@
 
 ## Overview
 
-In distributed machine learning training (PyTorch `DataLoader`, Ray Train, JAX) and large-scale columnar data analytics (Apache Arrow, Parquet, DuckDB), reading multi-gigabyte checkpoints and dataset partitions sequentially from Google Cloud Storage (GCS) incurs high network round-trip latency overhead between blocks. Today's [`GcsFile::read`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/file.rs#L225) issues synchronous 5 MiB block fetches, forcing calling threads to stall on network roundtrips between blocks while GPU/CPU compute sits idle. Furthermore, independent handles opening the same object and concurrent positional [`read_range`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/file.rs#L254) calls redundantly download duplicate byte ranges over the wire.
+In distributed machine learning training (PyTorch `DataLoader`, Ray Train, JAX) and large-scale columnar data analytics (Apache Arrow, Parquet, DuckDB), reading multi-gigabyte checkpoints and dataset partitions sequentially from Google Cloud Storage (GCS) incurs high network round-trip latency overhead between blocks. Today's [`GcsFile::read`](file:///home/princer_google_com/dev/gcs-rust-fs/src/gcs/file.rs#L225) issues synchronous 5 MiB block fetches, forcing calling threads to stall on network roundtrips between blocks while GPU/CPU compute sits idle. Furthermore, independent handles opening the same object and concurrent positional [`read_range`](file:///home/princer_google_com/dev/gcs-rust-fs/src/gcs/file.rs#L254) calls redundantly download duplicate byte ranges over the wire.
 
-We implement an **Asynchronous Readahead Engine and Page Cache** within the [`CachedFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs) VFS decorator. By placing data caching in the VFS decorator rather than modifying raw storage backends, this design preserves the crate's foundational invariant: **backends in this crate cache nothing; [`GcsFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/fs.rs) is strictly stateless**.
+We implement an **Asynchronous Readahead Engine and Page Cache** within the [`CachedFs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs) VFS decorator. By placing data caching in the VFS decorator rather than modifying raw storage backends, this design preserves the crate's foundational invariant: **backends in this crate cache nothing; [`GcsFs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/gcs/fs.rs) is strictly stateless**.
 
 We model the engine directly on the Linux kernel's dual-tier architecture (`mm/filemap.c` and `mm/readahead.c` at v6.6), providing:
 1. **Two Cohesive Operating Modes Under One Engine**:
    * **Readahead-Only Mode (`cache: None`)**: Private per-handle readahead buffer with immediate drop-behind behind the read cursor and per-window task cancellation on seek or handle drop. Optimized for high-throughput single-pass dataset streaming where cache hit rate is zero.
    * **Page Cache Mode (`cache: Some(PageCacheConfig)`)**: Shared object-level page cache (`ObjectPages`) keyed immutably by `ObjectKey` `(bucket, object, generation)`, coalescing concurrent reads and sharing folios across handles under a global LRU byte budget.
 2. **Kernel On-Demand Readahead**: An adaptive geometric ladder ($2 \to 4 \to 8 \to 16 \to 32 \to 64\text{ MiB}$) with marker folios (`PG_readahead`), submitting asynchronous background batches while the consumer is still reading current folios to eliminate window boundary stalls.
-3. **Clean OpenMode Handling**: `ReadaheadFile` decorates read handles ([`OpenMode::Read`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/options.rs#L25)), while write handles continue using [`CachedFile`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs#L484-L550) for directory listing invalidation.
-4. **Deterministic In-Memory Testability**: Fully testable on [`MemoryFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/tests/common/mod.rs#L75) without requiring live network connections, mock gRPC streams, or cloud credentials.
+3. **Clean OpenMode Handling**: `ReadaheadFile` decorates read handles ([`OpenMode::Read`](file:///home/princer_google_com/dev/gcs-rust-fs/src/options.rs#L25)), while write handles continue using [`CachedFile`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs#L484-L550) for directory listing invalidation.
+4. **Deterministic In-Memory Testability**: Fully testable on [`MemoryFs`](file:///home/princer_google_com/dev/gcs-rust-fs/tests/common/mod.rs#L75) without requiring live network connections, mock gRPC streams, or cloud credentials.
 
 --------------------------------------------------------------------------------
 
@@ -27,7 +27,8 @@ We model the engine directly on the Linux kernel's dual-tier architecture (`mm/f
 Embedding synchronous block buffering or stateful caching directly within backend file handles introduces architectural and operational issues:
 
 1. **Pipelining Latency & Hardware Starvation**: In PyTorch `DataLoader` workers, every 5 MiB block boundary forces the thread to block for 50–150 ms of network latency. For a 10 GiB checkpoint or dataset shard, this incurs over 2,000 synchronous stalls, dropping effective storage throughput from multi-gigabit wire capacity down to <150 MB/s.
-2. **Violation of Backend Statelessness**: Attempting to embed caching and background task supervisors in `GcsFs` violates the core architecture established in [`docs/filesystem_api_design.md`](file:///usr/local/google/home/princer/code/gcs-rust-fs/docs/filesystem_api_design.md). Backends must focus exclusively on RPC transport, generation pinning, and error translation; caching belongs in the VFS decorator layer.
+2. **Violation of Backend Statelessness**: Attempting to embed caching and background task supervisors in `GcsFs` violates the core architecture established in [`docs/filesystem_api_design.md`](file:///home/princer_google_com/dev/gcs-rust-fs/docs/filesystem_api_design.md). Backends must focus exclusively on RPC transport, generation pinning, and error translation; caching belongs in the VFS decorator layer.
+2. **Violation of Backend Statelessness**: Attempting to embed caching and background task supervisors in `GcsFs` violates the core architecture established in [`src/README.md`](file:///home/princer_google_com/dev/gcs-rust-fs/src/README.md). Backends must focus exclusively on RPC transport, generation pinning, and error translation; caching belongs in the VFS decorator layer.
 3. **Concurrency Hazards on Shared In-Flight Folios**: If a handle spawns a background fetch task into a shared object cache, and a second handle joins that in-flight future, aborting the first handle's task on `seek()` or `drop()` will abruptly cancel or panic the read operation of the second handle. In-flight tasks in a shared cache must be owned by the cache lifecycle, while private streaming tasks must remain strictly per-handle.
 4. **Cross-Handle Drop-Behind Complexity**: In a shared object cache, implementing drop-behind requires complex watermark tracking and handle registries, risking memory leaks or premature eviction of folios needed by lagging handles.
 5. **Redundant Network I/O Across Handles & Threads**: Multi-worker training pipelines and columnar query engines often open the same object across multiple tasks or issue concurrent positional `read_range` queries. Without an object-level page cache, each handle and range query independently downloads identical byte ranges.
@@ -36,7 +37,7 @@ Embedding synchronous block buffering or stateful caching directly within backen
 
 ## Goals
 
-*   **Preserve Backend Statelessness**: We implement all readahead scheduling, folio buffering, and page caching inside [`CachedFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs). Backends (including `GcsFs` and `MemoryFs`) remain completely stateless and provide only [`File::read_range`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs#L114).
+*   **Preserve Backend Statelessness**: We implement all readahead scheduling, folio buffering, and page caching inside [`CachedFs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs). Backends (including `GcsFs` and `MemoryFs`) remain completely stateless and provide only [`File::read_range`](file:///home/princer_google_com/dev/gcs-rust-fs/src/file.rs#L114).
 *   **Pipelined Sequential Streaming**: Pipeline network transport ahead of downstream consumer computation, serving sequential reads from pre-warmed in-memory buffers at memory copy speeds (<15 µs).
 *   **Clean Dual Modes (Readahead-Only vs Shared Page Cache)**:
     * Support zero-overhead drop-behind for single-pass workloads (`DataLoader`, checkpoint ingestion) with private per-handle indexes and per-window cancellation.
@@ -48,7 +49,7 @@ Embedding synchronous block buffering or stateful caching directly within backen
 *   **Decoupled Memory & Concurrency Bounds**:
     * Regulate active network transport via a page-unit semaphore (`max_inflight_bytes`), released immediately upon chunk arrival.
     * Regulate resident cache memory via an LRU list (`capacity_bytes`), evicting cold folios under memory pressure.
-*   **Deterministic In-Memory Testability**: Validate all state transitions, geometric ramps, chunk splitting, marker triggers, and cancellation deterministically on [`MemoryFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/tests/common/mod.rs#L75).
+*   **Deterministic In-Memory Testability**: Validate all state transitions, geometric ramps, chunk splitting, marker triggers, and cancellation deterministically on [`MemoryFs`](file:///home/princer_google_com/dev/gcs-rust-fs/tests/common/mod.rs#L75).
 
 --------------------------------------------------------------------------------
 
@@ -68,7 +69,7 @@ Embedding synchronous block buffering or stateful caching directly within backen
     * `io_size` = **8 MiB**: Default folio size for initial ramp stages.
     * `max_folio_size` = **32 MiB**: As sequential read streaks continue, folios grow up to 32 MiB (128 pages). For sustained multi-gigabyte checkpoint ingestion, this cuts request counts and HTTP/2 framing overhead in half compared to 16 MiB slices.
 *   **Decision 2: Read Pattern Advice on `OpenOptions` (`ReadPattern`)**:
-    * We expose `read_pattern: ReadPattern` (`Auto`, `Sequential`, `Random`) on [`OpenOptions`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/options.rs#L113), mirroring `posix_fadvise`:
+    * We expose `read_pattern: ReadPattern` (`Auto`, `Sequential`, `Random`) on [`OpenOptions`](file:///home/princer_google_com/dev/gcs-rust-fs/src/options.rs#L113), mirroring `posix_fadvise`:
       * `ReadPattern::Auto` (default): Uses the standard Linux v6.6 `ondemand_readahead` geometric ladder ($2 \to 4 \to 8 \to 16 \to 32 \to 64\text{ MiB}$).
       * `ReadPattern::Sequential`: Skips the initial probe ramp, immediately priming at `max_readahead` (64 MiB) with 32 MiB folios for known sequential streams.
       * `ReadPattern::Random`: Disables the speculative readahead ladder (`FMODE_RANDOM`), treating every read as a standalone single-page fetch to eliminate speculative memory overhead for random access.
@@ -118,7 +119,7 @@ Embedding synchronous block buffering or stateful caching directly within backen
 
 ### 1. High-Level Architecture Overview
 
-We implement data caching and readahead in [`src/cached.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs) as an extension to [`CachedFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs):
+We implement data caching and readahead in [`src/cached.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs) as an extension to [`CachedFs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs):
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -182,6 +183,7 @@ We port the Linux kernel v6.6 `mm/readahead.c` algorithm:
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, Shared};
@@ -202,12 +204,25 @@ pub struct ObjectKey {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheConfig {
     pub ttl: Option<Duration>,
     pub max_dirs: Option<usize>,
     pub negative: bool,
     pub populate_from_find: bool,
     pub data: Option<DataConfig>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl: None,
+            max_dirs: None,
+            negative: false,
+            populate_from_find: true,
+            data: Some(DataConfig::readahead_only()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -269,10 +284,13 @@ pub struct Folio {
     pub num_pages: u32,
     pub readahead_mark: AtomicBool,
     pub state: RwLock<FolioState>,
+    pub state: Mutex<FolioState>,
 }
 
+#[derive(Clone)]
 pub enum FolioState {
     Loading(Shared<BoxFuture<'static, Result<Bytes, Arc<Error>>>>),
+    Loading(Shared<BoxFuture<'static, std::result::Result<Bytes, Arc<Error>>>>),
     Ready(Bytes),
     Failed(Arc<Error>),
 }
@@ -282,6 +300,8 @@ pub enum Index {
     Private {
         folios: Mutex<BTreeMap<u64, Arc<Folio>>>,
         cancel_token: Mutex<CancellationToken>,
+        folios: Arc<Mutex<BTreeMap<u64, Arc<Folio>>>>,
+        cancel_token: Arc<Mutex<CancellationToken>>,
     },
     /// Mode 2: Shared across all handles for (bucket, object, generation); global LRU.
     Shared {
@@ -319,6 +339,7 @@ pub struct ReadaheadFile {
     pos: u64,
     size: u64,
     closed: bool,
+    is_clone: bool,
     stat: Option<ObjectStat>,
     ra_state: Mutex<ReadaheadState>,
     index: Index,
@@ -352,6 +373,7 @@ pub struct ReadaheadState {
        * If `target < cursor` (backward seek) OR `target - cursor > 8 * 1024 * 1024` (forward jump > 8 MiB):
          * `cancel_token.lock().cancel()` aborts all in-flight tasks for the abandoned window.
          * `*cancel_token.lock() = CancellationToken::new()` creates a fresh token for new tasks.
+         * `self.handle_semaphore` is replaced with a fresh `Semaphore` so cancelled tasks cannot starve post-seek reads.
          * Readahead state resets cleanly (`prev_pos = -1`) without latching dead cancellation.
          * Advance `cursor = target`.
    * On `drop()`:
@@ -368,8 +390,10 @@ pub struct ReadaheadState {
 ### 5. Quarantined Error Handling
 
 * **Transient Failures**: Background worker tasks retry transient transport errors (`ErrorKind::Timeout`, HTTP 503, gRPC `Status::unavailable`) up to 3 times with exponential backoff ($50\text{ ms} \to 150\text{ ms} \to 450\text{ ms}$) using `tokio::time::sleep`.
+* **Transient Failures**: Background worker tasks retry transient transport errors (`ErrorKind::Timeout`, `ErrorKind::Other`) up to 3 times with exponential backoff ($50\text{ ms} \to 150\text{ ms} \to 450\text{ ms}$) using `tokio::time::sleep`.
 * **Terminal Failures & Quarantining**: If retries fail or an unrecoverable error occurs, the folio transitions to `FolioState::Failed(Arc<Error>)`.
 * **Consumer Surfacing**: The error is surfaced to the caller only when a read operation requests bytes intersecting that failed folio. `Failed` folios remain quarantined in the map with a retry backoff cooldown to prevent infinite prefetch retry storms.
+* **Consumer Surfacing**: The error is surfaced to the caller only when a read operation requests bytes intersecting that failed folio. `Failed` folios remain quarantined in the map until evicted or dropped to prevent infinite prefetch retry storms.
 
 --------------------------------------------------------------------------------
 
@@ -398,6 +422,7 @@ pub struct ReadaheadState {
 
 ### 2. Latency & Pipelining Efficiency
 * **Cache Hit Latency**: Reading from a `Ready` folio takes **<15 microseconds** (memory copy).
+* **Cache Hit Latency**: Reading from a `Ready` folio takes **<15 microseconds** (zero-copy `Bytes::slice` fast path when satisfied by a single folio, or `BytesMut` copy across folio boundaries).
 * **Network Elimination**: Eliminates network stall bubbles for sequential streams exceeding 16 MiB.
 * **Seek Cancellation Latency**: Seeking in Mode 1 cancels background tasks within **<1 millisecond**.
 
@@ -415,6 +440,7 @@ pub struct ReadaheadState {
   * `gcsfs_cache_hits_total`, `gcsfs_cache_misses_total`
   * `gcsfs_cache_bytes_prefetched_total`, `gcsfs_cache_bytes_consumed_total`
   * `gcsfs_cache_bytes_evicted_total`
+* **Metadata Cache Stats**: `CachedFs::stats()` exposes `CacheStats { hits, misses, invalidations }` for directory and entry metadata lookups.
 
 --------------------------------------------------------------------------------
 
@@ -424,21 +450,23 @@ pub struct ReadaheadState {
 
 | File | Operation | Description |
 | :--- | :--- | :--- |
-| [`Cargo.toml`](file:///usr/local/google/home/princer/code/gcs-rust-fs/Cargo.toml) | **Modify** | Add `tokio-util = { version = "0.7", features = ["sync"] }` and ensure `tokio` in `[dependencies]` enables the `"time"` feature. |
-| [`src/lib.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/lib.rs) | **Modify** | Re-export `DataConfig`, `ReadaheadConfig`, `PageCacheConfig`, `ObjectKey`, and `ReadPattern` from `cached` and `options`. |
-| [`src/options.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/options.rs) | **Modify** | Add `ReadPattern` enum (`Auto`, `Sequential`, `Random`) and `pub read_pattern: ReadPattern` to `OpenOptions` with `with_pattern(mut self, pattern: ReadPattern) -> Self`. |
-| [`src/cached.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs) | **Modify** | Extend `CachedFs` with data caching: implement `DataConfig`, `ReadaheadConfig`, `PageCacheConfig`, `DataRuntime`, `PageCache`, `ReadaheadFile`, `Folio`, `FolioState`, and `Index`. Restrict `ReadaheadFile` to read handles; delegate write handles to `CachedFile`. |
-| [`src/file.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs) | **No change** | `File` trait already supports `read(&mut self, len: Option<usize>)` and `read_range(&self, range: ByteRange)`. |
-| [`src/gcs/file.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/file.rs) | **No change** | `GcsFile` remains strictly stateless, handling raw Cloud Storage streaming and positional range queries. |
-| [`tests/common/mod.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/tests/common/mod.rs) | **Modify** | Add `CountingFile` spy wrapper around `MemoryFile` to track backend `read_range` call counts and byte totals. |
-| [`tests/page_cache.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/tests/page_cache.rs) | **Create** | Deterministic test suite running on [`MemoryFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/tests/common/mod.rs#L75). Validates ladders, folios, marker triggers, drop-behind, LRU eviction, error quarantine, and cancellation. |
+| [`Cargo.toml`](file:///home/princer_google_com/dev/gcs-rust-fs/Cargo.toml) | **Modify** | Add `tokio-util = { version = "0.7", features = ["sync"] }` and ensure `tokio` in `[dependencies]` enables the `"time"` feature. |
+| [`Cargo.toml`](file:///home/princer_google_com/dev/gcs-rust-fs/Cargo.toml) | **Modify** | Add `tokio-util = "0.7"` and ensure `tokio` in `[dependencies]` enables the `"time"` feature. |
+| [`src/lib.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/lib.rs) | **Modify** | Re-export `DataConfig`, `ReadaheadConfig`, `PageCacheConfig`, `ObjectKey`, and `ReadPattern` from `cached` and `options`. |
+| [`src/options.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/options.rs) | **Modify** | Add `ReadPattern` enum (`Auto`, `Sequential`, `Random`) and `pub read_pattern: ReadPattern` to `OpenOptions` with `with_pattern(mut self, pattern: ReadPattern) -> Self`. |
+| [`src/cached.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs) | **Modify** | Extend `CachedFs` with data caching: implement `DataConfig`, `ReadaheadConfig`, `PageCacheConfig`, `DataRuntime`, `PageCache`, `ReadaheadFile`, `Folio`, `FolioState`, and `Index`. Restrict `ReadaheadFile` to read handles; delegate write handles to `CachedFile`. |
+| [`src/file.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/file.rs) | **No change** | `File` trait already supports `read(&mut self, len: Option<usize>)` and `read_range(&self, range: ByteRange)`. |
+| [`src/gcs/file.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/gcs/file.rs) | **No change** | `GcsFile` remains strictly stateless, handling raw Cloud Storage streaming and positional range queries. |
+| [`tests/common/mod.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/tests/common/mod.rs) | **Modify** | Add `CountingFile` spy wrapper around `MemoryFile` to track backend `read_range` call counts and byte totals. |
+| [`tests/page_cache.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/tests/page_cache.rs) | **Create** | Deterministic test suite running on [`MemoryFs`](file:///home/princer_google_com/dev/gcs-rust-fs/tests/common/mod.rs#L75). Validates ladders, folios, marker triggers, drop-behind, LRU eviction, error quarantine, and cancellation. |
 
 ### 2. Implementation Steps
 
-#### Step 1: Dependencies, Options & Configuration Exports ([`Cargo.toml`](file:///usr/local/google/home/princer/code/gcs-rust-fs/Cargo.toml), [`src/options.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/options.rs), [`src/lib.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/lib.rs))
+#### Step 1: Dependencies, Options & Configuration Exports ([`Cargo.toml`](file:///home/princer_google_com/dev/gcs-rust-fs/Cargo.toml), [`src/options.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/options.rs), [`src/lib.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/lib.rs))
 * In `Cargo.toml`:
   * Enable `"time"` on `tokio` in `[dependencies]`: `tokio = { version = "1", features = [..., "time"] }`.
   * Add `tokio-util = { version = "0.7", features = ["sync"] }`.
+  * Add `tokio-util = "0.7"`.
 * In `src/options.rs`:
   * Define `pub enum ReadPattern { Auto, Sequential, Random }`.
   * Add `pub read_pattern: ReadPattern` to `OpenOptions` (default: `ReadPattern::Auto`).
@@ -447,19 +475,22 @@ pub struct ReadaheadState {
   * Re-export `pub use cached::{CacheConfig, CacheStats, CachedFs, DataConfig, ReadaheadConfig, PageCacheConfig, ObjectKey};`.
   * Re-export `pub use options::ReadPattern;`.
 
-#### Step 2: Folio Structures & DataRuntime ([`src/cached.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs))
+#### Step 2: Folio Structures & DataRuntime ([`src/cached.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs))
 * Define `ObjectKey`, `DataConfig`, `ReadaheadConfig`, and `PageCacheConfig`.
 * Implement `Folio` with `first_page`, `num_pages`, `readahead_mark: AtomicBool`, and `state: RwLock<FolioState>`.
+* Implement `Folio` with `first_page`, `num_pages`, `readahead_mark: AtomicBool`, and `state: Mutex<FolioState>`.
 * Implement `PageCache`:
   * `new(capacity: usize) -> Self`
   * `record_access(&self, key: &ObjectKey, page: u64)`
   * `insert_folio(&self, key: &ObjectKey, folio: Arc<Folio>)`
+  * `add_bytes(&self, bytes: usize)`
   * `evict_if_needed(&self)`: evicts oldest folios according to `recency` until `used_bytes <= capacity_bytes`.
 * Implement `DataRuntime`:
   * Holds `inflight_semaphore`, `cache: Option<Arc<PageCache>>`, and `config: ReadaheadConfig`.
 
-#### Step 3: Implement `ReadaheadFile` and `Index` ([`src/cached.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs))
+#### Step 3: Implement `ReadaheadFile` and `Index` ([`src/cached.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs))
 * Define `Index::Private` with `cancel_token: Mutex<CancellationToken>`.
+* Define `Index::Private` with `folios: Arc<Mutex<BTreeMap<u64, Arc<Folio>>>>` and `cancel_token: Arc<Mutex<CancellationToken>>`.
 * Define `Index::Shared { pages: Arc<ObjectPages>, cache: Arc<PageCache> }`.
 * Implement `ReadaheadState` with Linux v6.6 `ondemand_readahead` logic:
   * Detect sequential vs random read patterns (Rule 7).
@@ -470,9 +501,10 @@ pub struct ReadaheadState {
   * `fn writable(&self) -> bool { false }`
   * `fn closed(&self) -> bool { self.closed || self.inner.closed() }`
   * `async fn close(&mut self) -> Result<()>`: sets `self.closed = true`, signals `cancel_token` in Mode 1, drains private folios, and calls `self.inner.close()`.
+  * `async fn close(&mut self) -> Result<()>`: sets `self.closed = true`, signals `cancel_token` in Mode 1, and clears private folios.
   * `async fn discard(&mut self) -> Result<()>`: delegates to `self.close().await`.
 
-#### Step 4: Implement Read Paths & Assembly ([`src/cached.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs))
+#### Step 4: Implement Read Paths & Assembly ([`src/cached.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs))
 * In `File::read(&mut self, len: Option<usize>) -> Result<Bytes>`:
   * Guard `ensure_open()`.
   * Compute `target_len = len.unwrap_or((self.size - self.pos) as usize).min((self.size - self.pos) as usize)`. If `target_len == 0`, return `Ok(Bytes::new())`.
@@ -498,6 +530,7 @@ pub struct ReadaheadState {
     }
     Ok(buf.freeze())
     ```
+  * Zero-copy single-folio fast path (`folio_data.slice(...)`) when satisfied by the first folio, falling back to `BytesMut` assembly across folio boundaries, followed by Mode 1 drop-behind eviction (`folios.lock().retain(...)`).
 * In `File::read_range(&self, range: ByteRange) -> Result<Bytes>`:
   * Guard `ensure_open()`.
   * In Mode 1: check private folios for hit; if miss, pass through directly to `self.inner.read_range(range).await` without polluting readahead state.
@@ -515,7 +548,7 @@ pub struct ReadaheadState {
       * Reset `self.ra_state` with `prev_pos = -1`.
   * `self.pos = new_offset; Ok(self.pos)`
 
-#### Step 5: Integrate with `CachedFs::open` ([`src/cached.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs))
+#### Step 5: Integrate with `CachedFs::open` ([`src/cached.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs))
 * In `CachedFs::open`:
   * If `opts.mode.is_write()` -> delegate to `CachedFile`.
   * If `opts.mode == OpenMode::Read`:

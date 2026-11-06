@@ -353,6 +353,7 @@ async fn run_20gb_uds_benchmark_suite(
     only: Option<&str>,
     seq_read_mb: usize,
     seq_io_mb: usize,
+    uds_pool_size: usize,
     json_out: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const RAND_IO_SIZE: usize = 1024 * 1024; // 1 MiB random read size & readahead io_size
@@ -605,6 +606,7 @@ async fn run_20gb_uds_benchmark_suite(
                 }),
             ));
             let (remote_seq_mt, _guard) = spawn_uds_sidecar(mode1_seq_mt, 48).await?;
+            let (remote_seq_mt, _guard) = spawn_uds_sidecar(mode1_seq_mt, uds_pool_size).await?;
 
             if run_seq_24t {
                 let label_24t = format!(
@@ -753,6 +755,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut only: Option<String> = None;
     let mut seq_read_mb: usize = 8;
     let mut seq_io_mb: usize = 16;
+    let mut uds_pool_size: usize = 48;
     let mut json_out: Option<String> = None;
 
     let mut i = 1;
@@ -775,6 +778,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     seq_io_mb = v.parse()?;
                 }
             }
+            "--uds-pool-size" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    uds_pool_size = v.parse()?;
+                }
+            }
             "--json-out" => {
                 i += 1;
                 json_out = args.get(i).cloned();
@@ -792,6 +801,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         only.as_deref(),
         seq_read_mb,
         seq_io_mb,
+        uds_pool_size,
         json_out.as_deref(),
     )
     .await

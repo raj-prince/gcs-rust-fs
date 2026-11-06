@@ -112,7 +112,6 @@ impl GcsFsBuilder {
     }
 
     /// Fill unset options from the environment: the transport from
-    /// [`Transport::ENV_VAR`] and the project from [`PROJECT_ENV_VARS`].
     /// [`Transport::ENV_VAR`], the HTTP pool size from
     /// [`HTTP_POOL_SIZE_ENV_VAR`], and the project from [`PROJECT_ENV_VARS`].
     /// Explicitly set options take precedence.

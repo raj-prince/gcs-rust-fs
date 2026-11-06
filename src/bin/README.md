@@ -2,6 +2,7 @@
 
 ## Overview
 Binary executable (`gcsfs-sidecar`) providing an out-of-process gRPC daemon serving `gcsfs.v1.FileSystemService` (`Info`, `Read`, `Write`) backed by `gcs-rust-fs`. It exposes Google Cloud Storage operations over a Unix Domain Socket (UDS) or TCP endpoint, enabling non-Rust callers (such as Python `gcsfs`) or isolated microservices to interact with GCS with zero Python-native C-extension dependencies.
+Binary executable (`gcsfs-sidecar`) providing an out-of-process gRPC daemon serving `gcsfs.v1.FileSystemService` (`Info`, `List`, `Read`, `Write`) backed by `gcs-rust-fs`. It exposes Google Cloud Storage operations over a Unix Domain Socket (UDS) or TCP endpoint, enabling non-Rust callers (such as Python `gcsfs`) or isolated microservices to interact with GCS with zero Python-native C-extension dependencies.
 
 ## Interface
 - `[gcsfs_sidecar.rs:main]`: Binary entrypoint for the `gcsfs-sidecar` service daemon.
@@ -12,6 +13,9 @@ Binary executable (`gcsfs-sidecar`) providing an out-of-process gRPC daemon serv
 - `[gcsfs_sidecar.rs:--endpoint <URL>]`: CLI option overriding the Cloud Storage service endpoint (useful for storage testbenches and emulators).
 - `[gcsfs_sidecar.rs:--project <PROJECT>]`: CLI option setting the GCP project ID.
 - `[gcsfs_sidecar.rs:--cache]`: CLI flag enabling in-memory directory and metadata caching via `CachedFs`.
+- `[gcsfs_sidecar.rs:--readahead]`: CLI flag enabling Mode 1 asynchronous streaming readahead (`max_readahead = 256 MiB`, `io_size = 16 MiB`, `max_folio_size = 16 MiB`, `max_inflight = 16`, `max_inflight_bytes = 4 GiB`).
+- `[gcsfs_sidecar.rs:--page-cache-mb <MB>]`: CLI option enabling Mode 2 shared `PageCache` with the specified MiB capacity.
+- `[gcsfs_sidecar.rs:--http-pool-size <N>]`: CLI option configuring the number of pooled HTTP `Storage` clients on `GcsFsBuilder`.
 - `[gcsfs_sidecar.rs:--help | -h]`: CLI flags printing command usage to standard error and exiting.
 
 ## Invariants
@@ -20,7 +24,9 @@ Binary executable (`gcsfs-sidecar`) providing an out-of-process gRPC daemon serv
 - `[gcsfs_sidecar.rs:SidecarArgs::parse]`: When `--tcp` is provided, TCP listener takes precedence over `--uds`.
 - `[gcsfs_sidecar.rs:SidecarArgs::parse]`: Transport defaults to the `GCS_RUST_FS_TRANSPORT` environment variable value if set and non-empty, otherwise defaulting to `Transport::Http`.
 - `[gcsfs_sidecar.rs:SidecarArgs::parse]`: `--tcp` must parse to a valid `std::net::SocketAddr`, and `--transport` must be either `http` or `grpc`; invalid values yield `ErrorKind::InvalidConfig`.
+- `[gcsfs_sidecar.rs:SidecarArgs::parse]`: `--tcp` must parse to a valid `std::net::SocketAddr`, `--page-cache-mb` and `--http-pool-size` must parse as `usize`, and `--transport` must be either `http` or `grpc`; invalid values yield `ErrorKind::InvalidConfig`.
 - `[gcsfs_sidecar.rs:SidecarArgs::parse]`: Encountering any unrecognized command-line flag returns `ErrorKind::InvalidConfig`.
+- `[gcsfs_sidecar.rs:main]`: `GcsFs` is wrapped in `CachedFs` whenever any of `--cache`, `--readahead`, or `--page-cache-mb` is supplied.
 - `[gcsfs_sidecar.rs:main]`: Running server terminates cleanly upon receiving `SIGINT` (Ctrl+C) or `SIGTERM`.
 
 ## Side Effects

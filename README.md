@@ -45,6 +45,10 @@ implementation at runtime; `tests/common/mod.rs` is an in-memory implementation
 that exercises every derived operation without network. The full semantics
 (directory emulation, fsspec copy rules, error classes, open decisions) are in
 [`docs/filesystem_api_design.md`](docs/filesystem_api_design.md).
+implementation at runtime; [`tests/common/mod.rs`](tests/common/mod.rs) is an in-memory implementation
+that exercises every derived operation without network. The core contract and
+decorator architecture are documented in [`src/README.md`](src/README.md) and
+[`docs/designs/async_prefetch_engine.md`](docs/designs/async_prefetch_engine.md).
 
 ## Features
 
@@ -142,6 +146,7 @@ Writing to zonal buckets additionally requires building with the storage
 SDK's `google_cloud_unstable_storage_bidi` cfg — this repo sets it in
 [`.cargo/config.toml`](.cargo/config.toml); see the
 [dev guide](docs/dev_guide.md#zonal-writes-need-a-rustc-cfg).
+[`.cargo/config.toml`](.cargo/config.toml).
 
 ## Caching
 
@@ -153,6 +158,11 @@ without ever being mistaken for a complete listing. Design and rationale:
 [`docs/dir_cache_design.md`](docs/dir_cache_design.md); the planned data
 half (readahead and page cache):
 [`docs/page_cache_design.md`](docs/page_cache_design.md).
+without ever being mistaken for a complete listing. On the data path,
+`CachedFs` also implements a Linux v6.6-inspired asynchronous readahead engine
+(Mode 1 private drop-behind readahead by default via `DataConfig::readahead_only()`,
+and Mode 2 shared generation-keyed LRU `PageCache` via `DataConfig::page_cache(capacity)`):
+see [`docs/designs/async_prefetch_engine.md`](docs/designs/async_prefetch_engine.md).
 
 ```rust
 use bytes::Bytes;
@@ -191,6 +201,12 @@ What it does, and the `gcsfs` behaviour it mirrors:
 * `CacheConfig { ttl, max_dirs, negative, populate_from_find }` map to
   fsspec's `listings_expiry_time`, `max_paths` and the implicit
   `_ls_from_cache` behaviours. `negative` (answer *not found* from a cached
+* `ListOptions::versions` and `path#generation` bypass the directory/metadata cache.
+* `CacheConfig { ttl, max_dirs, negative, populate_from_find, data }` map to
+  fsspec's `listings_expiry_time`, `max_paths`, the implicit
+  `_ls_from_cache` behaviours, and the data readahead/page-cache engine (`data`
+  defaults to `Some(DataConfig::readahead_only())`; set `data: None` for raw
+  unbuffered pass-through). `negative` (answer *not found* from a cached
   listing without asking) is **off** by default because it is the one answer
   that is wrong when another process creates a file; turn it on for
   `exists`-heavy loops when this client is the only writer.
@@ -211,6 +227,7 @@ buckets choose with `GcsFsBuilder::transport(..)` or the
 |-------------|-----------|-------|
 | `Grpc` (default) | `Storage::open_object` → `BidiReadObject` | Fastest path; one RPC per `cat_file` (open + read are fused). **Only enabled for some projects/buckets** — when the service reports it unavailable the read falls back to HTTP with a warning. |
 | `Http` | `Storage::read_object` → JSON API with `Range` headers | Universally available. |
+| `Http` | `Storage::read_object` → JSON API with `Range` headers | Universally available. Stripes requests across a pool of `Storage` HTTP clients (`GcsFsBuilder::http_pool_size` / `GCS_RUST_FS_HTTP_POOL_SIZE`, default `16`). |
 
 Zonal buckets are gRPC-only and ignore the setting. Both transports return
 byte-identical results and classify errors identically.
@@ -253,12 +270,18 @@ cargo run --example gcs -- kind  my-bucket
 ```bash
 # Start server listening on /tmp/gcsfs.sock
 cargo run --bin gcsfs-sidecar -- --uds /tmp/gcsfs.sock --mode 0666 --cache
+# Start server listening on /tmp/gcsfs.sock with metadata cache, Mode 1 readahead, and 32 HTTP clients
+cargo run --bin gcsfs-sidecar -- --uds /tmp/gcsfs.sock --mode 0666 --cache --readahead --http-pool-size 32
 
 # Or serve multiple UDS paths simultaneously:
+# Or serve multiple UDS paths simultaneously (optionally with Mode 2 shared page cache):
 cargo run --bin gcsfs-sidecar -- \
   --uds /tmp/gcsfs-worker0.sock \
   --uds /tmp/gcsfs-worker1.sock \
   --mode 0666
+  --mode 0666 \
+  --readahead \
+  --page-cache-mb 512
 ```
 
 ### Testing the Running Server with the CLI
@@ -289,6 +312,10 @@ GCS_RUST_FS_TEST_BUCKETS=flat=b1,hns=b2,zonal=b3 cargo test --test live         
 
 Building the example binary, the CI lint gate and the repo layout are in
 [`docs/dev_guide.md`](docs/dev_guide.md).
+Benchmark reports and architectural designs are located in [`docs/`](docs/):
+- [`docs/native_rust_fs_benchmark_report.md`](docs/native_rust_fs_benchmark_report.md)
+- [`docs/uds_rust_fs_benchmark_report.md`](docs/uds_rust_fs_benchmark_report.md)
+- [`docs/designs/`](docs/designs/)
 
 ## Local Interface & Invariants
 - `[build.rs:main]`: Cargo build script executing `tonic_prost_build` to compile `proto/gcsfs/v1/filesystem.proto` into Rust tonic client/server code during crate build.
@@ -296,8 +323,12 @@ Building the example binary, the CI lint gate and the repo layout are in
 
 ## Subdirectories & System Boundaries
 - [src](./src/README.md): Core `FileSystem` and `File` async traits, error classification, range abstractions (`ByteRange`), in-memory directory cache decorator (`CachedFs`), GCS storage backend (`gcs`), and gRPC sidecar daemon (`bin`, `rpc`).
+- [src](./src/README.md): Core `FileSystem` and `File` async traits, error classification, range abstractions (`ByteRange`), directory/metadata cache and readahead/page-cache decorator (`CachedFs`), GCS storage backend (`gcs`), and gRPC sidecar daemon (`bin`, `rpc`).
 - [proto](./proto/README.md): Protobuf schema root for all RPC service definitions and data serialization contracts used across `gcs-rust-fs`.
 - [examples](./examples/README.md): CLI example utility (`examples/gcs.rs`) for interacting with Google Cloud Storage buckets (Flat, Hierarchical Namespace, and Zonal) using the `FileSystem` interface.
+- [examples](./examples/README.md): CLI example utility (`examples/gcs.rs`) and benchmark suites (`examples/bench_ipc.rs`, `examples/bench_live_readahead.rs`, `examples/bench_uds_readahead.rs`).
+- `docs/`: Benchmark reports and architecture design documents (`docs/designs/`).
+- `tests/`: Integration test suites (`tests/memory_fs.rs`, `tests/cache.rs`, `tests/page_cache.rs`, `tests/rpc.rs`, `tests/live.rs`).
 
 ## Global Invariants
 - Directories are emulated within flat buckets via `/` delimiters and placeholder objects; Hierarchical Namespace (HNS) buckets provide real server-side directory objects and atomic folder renames.
@@ -305,6 +336,7 @@ Building the example binary, the CI lint gate and the repo layout are in
 - Regular writes are staged and published atomically on Cloud Storage only upon successful `close()`; unclosed dropped handles discard pending uploads.
 - Python-slice byte range indexing (`ByteRange`) applies across all read APIs, resolving bounds backwards for negative indices and returning empty byte buffers for out-of-range reads.
 - Cache entries in `CachedFs` never store file payload data; mutating operations consistently invalidate affected directories, ancestors, or entire subtrees across both flat and hierarchical stores.
+- `CachedFs` maintains `fsspec`-consistent directory and entry metadata caches (invalidating affected directories, ancestors, or subtrees on mutation) alongside Mode 1 per-handle drop-behind readahead (`DataConfig::readahead_only()`, default) or Mode 2 shared generation-keyed LRU page caching (`DataConfig::page_cache`).
 
 ## Global Side Effects
 - Cloud Storage Remote State: Communicates over gRPC and HTTP with Google Cloud Storage endpoints, creating, rewriting, renaming, and deleting objects and folders.

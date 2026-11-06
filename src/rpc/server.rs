@@ -37,13 +37,13 @@ pub const MAX_READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 /// Maximum gRPC message size (`16 MiB`) accepted and emitted by the sidecar.
 pub const MAX_GRPC_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
-/// HTTP/2 initial per-stream flow-control window (`64 MiB`).
+/// HTTP/2 initial per-stream flow-control window (`16 MiB`).
 const HTTP2_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 
-/// HTTP/2 initial connection-level flow-control window (`256 MiB`).
+/// HTTP/2 initial connection-level flow-control window (`64 MiB`).
 const HTTP2_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 
-/// HTTP/2 maximum frame size (`16 MiB - 1`, RFC 7540 limit).
+/// HTTP/2 maximum frame size (`4 MiB`).
 const HTTP2_MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
 /// gRPC service handler backed by any [`FileSystem`] implementation.

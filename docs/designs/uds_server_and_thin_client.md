@@ -10,7 +10,7 @@
 
 Python [`gcsfs`](https://github.com/fsspec/gcsfs) is the dominant Google Cloud Storage filesystem interface used across distributed machine learning (PyTorch `DataLoader`, Ray Train, JAX) and batch data processing (Dask, Apache Arrow). In containerized multi-tenant environments like Google Kubernetes Engine (GKE), running heavyweight storage runtimes directly inside every Python worker process leads to severe memory duplication, client initialization latency, and complex credential distribution.
 
-This design document establishes the architecture, wire protocol, and implementation plan for exposing [`gcs-rust-fs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/lib.rs) as an out-of-process server communicating over a Unix Domain Socket (UDS, e.g. `unix:///var/run/gcsfs/sidecar.sock`). A lightweight, thin Python `gcsfs` client connects to this socket, translating standard `fsspec` filesystem calls (`info`, `cat_file`, `open`, `ls`, `pipe_file`) into streaming gRPC calls backed by high-throughput HTTP/JSON and DirectPath gRPC transports.
+This design document establishes the architecture, wire protocol, and implementation plan for exposing [`gcs-rust-fs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/lib.rs) as an out-of-process server communicating over a Unix Domain Socket (UDS, e.g. `unix:///var/run/gcsfs/sidecar.sock`). A lightweight, thin Python `gcsfs` client connects to this socket, translating standard `fsspec` filesystem calls (`info`, `cat_file`, `open`, `ls`, `pipe_file`) into streaming gRPC calls backed by high-throughput HTTP/JSON and DirectPath gRPC transports.
 
 --------------------------------------------------------------------------------
 
@@ -53,6 +53,8 @@ An out-of-process daemon communicating over a local Unix Domain Socket decouples
 
 *   **Question 1: Optimal Streaming Chunk Size over UDS**: What default chunk size maximizes throughput over UDS socket buffers without exceeding gRPC framing limits or inducing kernel buffer thrashing? (Baseline: `1 MiB` default chunks, up to `3.5 MiB` maximum, leaving 512 KiB headroom under gRPC's 4 MiB frame limit).
 *   **Question 2: Directory Listing (`List` RPC)**: Should `List` be added to `gcsfs.v1.FileSystemService` in `proto/gcsfs/v1/filesystem.proto` to complement single-object `Info` for high-performance `ls` and `find` operations? (Resolved in Technical Plan: Add `rpc List(ListRequest) returns (ListResponse)` to avoid N+1 `Info` queries).
+*   **Question 1: Optimal Streaming Chunk Size over UDS**: What default chunk size maximizes throughput over UDS socket buffers without exceeding gRPC framing limits or inducing kernel buffer thrashing? (Resolved: `1 MiB` default chunks (`DEFAULT_READ_CHUNK_SIZE`), up to `8 MiB` maximum (`MAX_READ_CHUNK_SIZE`) with `16 MiB` gRPC message size limits (`MAX_GRPC_MESSAGE_SIZE`) and `16 MiB`/`64 MiB` HTTP/2 stream/connection flow-control windows).
+*   **Question 2: Directory Listing (`List` RPC)**: Should `List` be added to `gcsfs.v1.FileSystemService` in `proto/gcsfs/v1/filesystem.proto` to complement single-object `Info` for high-performance `ls` and `find` operations? (Resolved in Technical Plan: Added `rpc List(ListRequest) returns (ListResponse)` to avoid N+1 `Info` queries).
 
 --------------------------------------------------------------------------------
 
@@ -146,10 +148,12 @@ service FileSystemService {
    * Response: `Entry` (`path`, `kind: FILE | DIRECTORY`, `size`, and full `ObjectStat`).
 2. **`List`**:
    * Request: `prefix`, optional `delimiter`, and `detail: bool`.
+   * Request: `path`, `versions: bool`, and `refresh: bool`.
    * Response: `repeated Entry entries`.
 3. **`Read`**:
    * Request: `path`, optional `ByteRange` (`start`, `end` using Python-slice semantics), and `ReadOptions` (`chunk_size`).
    * Response: Server-streaming `ReadResponse` yielding `bytes data` frames (default `1 MiB`, bounded to `3.5 MiB`).
+   * Response: Server-streaming `ReadResponse` yielding `bytes data` frames (default `1 MiB`, bounded to `8 MiB` via `MAX_READ_CHUNK_SIZE` under `16 MiB` `MAX_GRPC_MESSAGE_SIZE`).
 4. **`Write`**:
    * Request: Client-streaming `WriteRequest` with `oneof { WriteSpec spec; bytes data; }`.
    * The first message must contain `WriteSpec` (`path`, `mode: OVERWRITE | CREATE`, `content_type`, `metadata`). Subsequent messages stream raw byte chunks.
@@ -160,7 +164,7 @@ service FileSystemService {
 
 Standard gRPC error codes conflate distinct filesystem failure modes (e.g. `INVALID_ARGUMENT` covers both invalid paths and invalid byte ranges; `FAILED_PRECONDITION` covers `IsADirectory`, `NotADirectory`, and `DirectoryNotEmpty`).
 
-To preserve 100% exception fidelity across the UDS wire, the server attaches the exact [`ErrorKind`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/error.rs) string to the gRPC response metadata header `x-gcsfs-error-kind`.
+To preserve 100% exception fidelity across the UDS wire, the server attaches the exact [`ErrorKind`](file:///home/princer_google_com/dev/gcs-rust-fs/src/error.rs) string to the gRPC response metadata header `x-gcsfs-error-kind`.
 
 The thin client reads `x-gcsfs-error-kind` from trailing metadata and maps directly to Python standard exceptions:
 
@@ -193,12 +197,21 @@ The server binary is implemented in `src/bin/gcsfs_sidecar.rs` and backed by `sr
    * Drains in-flight gRPC streams via `serve_with_incoming_shutdown`.
    * Unlinks all socket files upon process termination.
 3. **Transport & Caching Configuration**:
+2. **Graceful Shutdown & Socket Lifecycle**:
+   * Unlinks any pre-existing stale socket files on startup (`fs::remove_file`) before binding `UnixListener`.
+   * Traps `SIGINT` (`tokio::signal::ctrl_c`) to drain in-flight gRPC streams via `serve_with_incoming_shutdown`.
+3. **Transport, Readahead, & Caching Configuration**:
    * Supports command-line flags:
      * `--uds <PATH>`: Path to Unix Domain Socket (repeatable for multi-UDS).
      * `--mode <OCTAL>`: Unix socket file permissions (e.g. `0666`).
+     * `--mode <OCTAL>`: Unix socket file permissions (default `0666`).
      * `--tcp <ADDR>`: Alternative TCP address for testing.
      * `--transport <http|grpc>`: Underlying GCS transport (`Transport::Http` default, or `Transport::Grpc` for DirectPath).
-     * `--cache`: Wraps backend in [`CachedFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/cached.rs) to share directory listings and metadata cache across all connected client processes.
+     * `--http-pool-size <N>`: Number of striped `reqwest::Client` instances in the HTTP connection pool (default `16`).
+     * `--cache`: Wraps backend in [`CachedFs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/cached.rs) to share directory listings and metadata cache across all connected client processes.
+     * `--readahead`: Enables Mode 1 per-handle asynchronous adaptive readahead (`16 MiB` `io_size`, `256 MiB` `max_readahead`, `16` `max_inflight`).
+     * `--page-cache-mb <MB>`: Enables Mode 2 shared multi-file sharded LRU `PageCache` of `<MB>` MiB inside the sidecar daemon.
+     * `--endpoint <URL>` and `--project <PROJECT>`: Optional custom GCS endpoint and billing/quota project overrides.
 
 ### 5. Thin Python Client Architecture (`gcsfs-uds`)
 
@@ -275,49 +288,62 @@ The thin Python client implements an `fsspec`-compliant filesystem by wrapping `
 
 ### Target Files to Create / Modify
 
-#### 1. [`proto/gcsfs/v1/filesystem.proto`](file:///usr/local/google/home/princer/code/gcs-rust-fs/proto/gcsfs/v1/filesystem.proto) (Modify)
+#### 1. [`proto/gcsfs/v1/filesystem.proto`](file:///home/princer_google_com/dev/gcs-rust-fs/proto/gcsfs/v1/filesystem.proto) (Modify)
 *   **Type / Scope**: Protobuf Schema Definition
 *   **Proposed Changes**:
     *   Add `rpc List(ListRequest) returns (ListResponse);` to `service FileSystemService`.
     *   Define `message ListRequest { string prefix = 1; optional string delimiter = 2; bool detail = 3; }`.
+    *   Define `message ListRequest { string path = 1; bool versions = 2; bool refresh = 3; }`.
     *   Define `message ListResponse { repeated Entry entries = 1; }`.
 *   **Rationale**: Enables directory listing and tree traversal over UDS without requiring N+1 `Info` queries.
 
-#### 2. [`src/rpc/server.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/rpc/server.rs) (Modify)
+#### 2. [`src/rpc/server.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/rpc/server.rs) (Modify)
 *   **Type / Scope**: Rust gRPC Server Service Implementation
 *   **Proposed Changes**:
     *   Implement `list` RPC method on `FileSystemRpcService` calling `self.fs.ls()` or `self.fs.find()`.
     *   Expose socket file permission configuration (`0666` default for UDS).
 *   **Rationale**: Completes `fsspec` API coverage for the gRPC server.
+    *   Implement `list` RPC method on `FileSystemRpcService` calling `self.fs.ls_with_options()`.
+    *   Expose socket file permission configuration (`0666` default for UDS) and span-based `ReadPattern` selection in `read`.
+*   **Rationale**: Completes `fsspec` API coverage and readahead support for the gRPC server.
 
-#### 3. [`src/bin/gcsfs_sidecar.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/bin/gcsfs_sidecar.rs) (Modify)
+#### 3. [`src/bin/gcsfs_sidecar.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/bin/gcsfs_sidecar.rs) (Modify)
 *   **Type / Scope**: Server Binary CLI & Lifecycle
 *   **Proposed Changes**:
     *   Remove deprecation warnings (since sidecar is the target architecture of this design).
     *   Add `--socket-mode <OCTAL>` flag (defaulting to `0666`) to configure UDS socket file permissions.
     *   Add Unix signal traps (`SIGTERM`, `SIGINT`) to ensure graceful cleanup of the socket file.
+    *   Support `--mode <OCTAL>` flag (defaulting to `0666`) to configure UDS socket file permissions, plus `--readahead`, `--page-cache-mb <MB>`, and `--http-pool-size <N>`.
+    *   Unlink stale socket files prior to binding and trap `SIGINT` (`ctrl_c`) for graceful stream draining.
 *   **Rationale**: Ensures reliable deployment in multi-user and Kubernetes pod container environments.
 
-#### 4. [`src/rpc/client.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/rpc/client.rs) (Modify)
+#### 4. [`src/rpc/client.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/rpc/client.rs) (Modify)
 *   **Type / Scope**: Rust Remote Client
+*   **Type / Scope**: Rust Remote Client (`RemoteFs`, `RemoteFile`)
 *   **Proposed Changes**:
     *   Implement `ls` on `RemoteFs` delegating to the new `List` RPC.
+    *   Implement `ls_with_options` on `RemoteFs` delegating to the `List` RPC, `connect_uds_with_pool_size` for pooled `UnixStream` connections, and persistent streaming `Read` on `RemoteFile`.
 *   **Rationale**: Keeps Rust `RemoteFs` client 100% feature-complete with the server.
 
-#### 5. [`tests/rpc.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/tests/rpc.rs) (Modify)
+#### 5. [`tests/rpc.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/tests/rpc.rs) (Modify)
 *   **Type / Scope**: Integration Test Suite
 *   **Proposed Changes**:
     *   Add integration tests for `List` RPC over UDS.
     *   Add multi-client concurrent streaming test over UDS.
+    *   Add integration tests for `List` RPC over UDS, `CachedFs` readahead over UDS, and multi-client concurrent streaming over UDS.
 *   **Rationale**: Verifies streaming correctness, concurrency, and error handling over UDS.
 
 #### 6. `python/gcsfs_uds/` (Create)
 *   **Type / Scope**: Thin Python gRPC Client Library
+#### 6. External Python Repository (`fsspec/gcsfs` UDS Adapter)
+*   **Type / Scope**: Thin Python gRPC Client Library (maintained in the Python `gcsfs` repository alongside [`examples/bench_uds_readahead.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/examples/bench_uds_readahead.rs) for Rust UDS benchmarking)
 *   **Proposed Changes**:
     *   `python/gcsfs_uds/client.py`: Implements `UdsGCSFileSystem` extending `fsspec.spec.AbstractFileSystem`.
     *   `python/gcsfs_uds/file.py`: Implements `UdsBufferedFile` for streaming read/write file handles.
     *   `python/gcsfs_uds/errors.py`: Maps `x-gcsfs-error-kind` into Python exception types.
 *   **Rationale**: Delivers the thin client package for Python users.
+    *   Implements `UdsGCSFileSystem` extending `fsspec.spec.AbstractFileSystem`, streaming read/write file handles, and `x-gcsfs-error-kind` exception mapping in the Python `gcsfs` repository.
+*   **Rationale**: Keeps `gcs-rust-fs` a pure-Rust crate while providing the thin Python client in `gcsfs`.
 
 ---
 

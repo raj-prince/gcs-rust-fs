@@ -1,7 +1,7 @@
 //! Sidecar gRPC server binary (`gcsfs-sidecar`).
 //!
 //! Defaults to `Transport::Http` (the JSON/HTTP data path) and serves
-//! `gcsfs.v1.FileSystemService` (`Info`, `Read`, `Write`) over a Unix Domain
+//! `gcsfs.v1.FileSystemService` (`Info`, `List`, `Read`, `Write`) over a Unix Domain
 //! Socket (or TCP address).
 
 use std::net::SocketAddr;

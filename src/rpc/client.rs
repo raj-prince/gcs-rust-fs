@@ -44,13 +44,13 @@ const DEFAULT_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 /// Default number of parallel UDS HTTP/2 subchannels opened by [`RemoteFs::connect_uds`].
 const DEFAULT_UDS_POOL_SIZE: usize = 16;
 
-/// HTTP/2 initial per-stream flow-control window (`64 MiB`).
+/// HTTP/2 initial per-stream flow-control window (`16 MiB`).
 const HTTP2_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 
-/// HTTP/2 initial connection-level flow-control window (`256 MiB`).
+/// HTTP/2 initial connection-level flow-control window (`64 MiB`).
 const HTTP2_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 
-/// HTTP/2 maximum frame size (`16 MiB - 1`, RFC 7540 limit).
+/// HTTP/2 maximum frame size (`4 MiB`).
 const HTTP2_MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
 /// A [`FileSystem`] client that delegates operations to a `gcs-rust-fs` gRPC

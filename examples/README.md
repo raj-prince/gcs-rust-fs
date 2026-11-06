@@ -2,8 +2,14 @@
 
 ## Overview
 Command-line example demonstrating integration with the `gcs-rust-fs` crate. It provides an interactive CLI tool (`examples/gcs.rs`) for testing and interacting with Google Cloud Storage buckets (Flat, Hierarchical Namespace, and Zonal) using the `FileSystem` abstraction.
+Command-line utilities and benchmark harnesses demonstrating integration with the `gcs-rust-fs` crate:
+- `examples/gcs.rs`: Interactive CLI tool for testing and interacting with Google Cloud Storage buckets (Flat, Hierarchical Namespace, and Zonal) directly or via a UDS sidecar using the `FileSystem` abstraction.
+- `examples/bench_ipc.rs`: Synthetic microbenchmark comparing in-process zero-copy memory transfer against out-of-process gRPC over Unix Domain Sockets (`FileSystemRpcService` + `RemoteFs`).
+- `examples/bench_live_readahead.rs`: Live 4-part `20 GiB` Native Rust benchmark suite (`Transport::Http`, `ReadPattern::Auto`) measuring uncached `info()`, `1 MiB` random reads, `20 GiB` sequential reads (`1T`, `24T`, `48T`), and `200 MiB` writes.
+- `examples/bench_uds_readahead.rs`: Live 4-part `20 GiB` UDS benchmark suite (`RemoteFs` over `unix://` to `FileSystemRpcService` wrapping `CachedFs<GcsFs>`) measuring uncached `info()`, `1 MiB` random reads, `20 GiB` sequential reads (`1T`, `24T`, `48T` with configurable `UnixStream` pooling via `--uds-pool-size`), and `200 MiB` writes.
 
 ## Interface
+### `examples/gcs.rs`
 - `[gcs.rs:main]`: CLI entry point returning `std::process::ExitCode`.
 - `[gcs.rs:run]`: Async execution dispatcher mapping CLI commands (`info`, `ls`, `find`, `walk`, `du`, `cat`, `get`, `put`, `pipe`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `kind`) to `FileSystem` and `GcsFs` operations.
 - `[gcs.rs:parse_args]`: Parses command line options, flags (`--start`, `--end`, `--maxdepth`, `--transport`, `--uds`, `-r`, `--recursive`, `--withdirs`, `--versions`, `-p`, `--placeholder`), and positional parameters into `Args`.
@@ -24,6 +30,17 @@ Command-line example demonstrating integration with the `gcs-rust-fs` crate. It 
 - `[gcs.rs:run:mkdir]`: `gcs mkdir <path> [-p] [--placeholder]` — Creates folders or placeholder directory objects.
 - `[gcs.rs:run:rmdir]`: `gcs rmdir <path>` — Deletes an empty directory.
 - `[gcs.rs:run:kind]`: `gcs kind <bucket>` — Resolves and displays the storage layout kind (`Flat`, `Hierarchical`, `Zonal`).
+
+### `examples/bench_ipc.rs`
+- `[bench_ipc.rs:main]`: Runs in-process `BenchFs` vs UDS `RemoteFs` latency and throughput benchmarks across single-socket and multi-socket topologies.
+
+### `examples/bench_live_readahead.rs`
+- `[bench_live_readahead.rs:main]`: Parses `--bench-20gb`, `--only <all|info|random|seq|seq-1t|seq-24t|seq-48t|write>`, `--read-size-mb <MIB>`, `--io-size-mb <MIB>`, `--json-out <PATH>`, and optional `[GS_PATH]` (default `gs://princer-flat/bench/bench_20GB.bin`).
+- `[bench_live_readahead.rs:run_20gb_benchmark_suite]`: Executes the 4-part live Native Rust benchmark suite using `CachedFs<GcsFs>` (`Transport::Http`, `ReadPattern::Auto`) and optionally writes a JSON summary report.
+
+### `examples/bench_uds_readahead.rs`
+- `[bench_uds_readahead.rs:main]`: Parses `--bench-20gb`, `--only <all|info|random|seq|seq-1t|seq-24t|seq-48t|write>`, `--read-size-mb <MIB>`, `--io-size-mb <MIB>`, `--uds-pool-size <N>` (default `48`), `--json-out <PATH>`, and optional `[GS_PATH]` (default `gs://princer-flat/bench/bench_20GB.bin`).
+- `[bench_uds_readahead.rs:run_20gb_uds_benchmark_suite]`: Spawns an in-process UDS sidecar (`FileSystemRpcService`) and executes the 4-part benchmark suite through `RemoteFs::connect_uds_with_pool_size`.
 
 ## Invariants
 - `[gcs.rs:parse_args]`: A command keyword must be supplied as the first positional argument; omitting it fails with `"missing command"` and returns exit code 2.

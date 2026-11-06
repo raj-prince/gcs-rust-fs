@@ -2,14 +2,19 @@
 
 ## Overview
 Protocol buffer definitions (v1) defining the gRPC sidecar file system service (`FileSystemService`) backed by `gcs-rust-fs`. It provides object storage operations structured as a filesystem, supporting file/directory inspection, streaming byte-range reads, and streaming atomic writes.
+Protocol buffer definitions (v1) defining the gRPC sidecar file system service (`FileSystemService`) backed by `gcs-rust-fs`. It provides object storage operations structured as a filesystem, supporting file/directory inspection, directory listing, streaming byte-range reads, and streaming atomic writes.
 
 ## Interface
 - `[filesystem.proto:FileSystemService]`: gRPC service exposing `Info`, `Read`, and `Write` RPC methods
+- `[filesystem.proto:FileSystemService]`: gRPC service exposing `Info`, `List`, `Read`, and `Write` RPC methods
 - `[filesystem.proto:Info]`: RPC `Info(InfoRequest) returns (InfoResponse)` describing path entries (file, directory, or not found)
+- `[filesystem.proto:List]`: RPC `List(ListRequest) returns (ListResponse)` listing directory children or matching prefixes
 - `[filesystem.proto:Read]`: Streaming RPC `Read(ReadRequest) returns (stream ReadResponse)` reading byte ranges or entire objects
 - `[filesystem.proto:Write]`: Streaming RPC `Write(stream WriteRequest) returns (WriteResponse)` for atomic object uploads
 - `[filesystem.proto:InfoRequest]`: Path query message (`path` in `bucket/key`, `gs://bucket/key`, or generation form)
 - `[filesystem.proto:InfoResponse]`: Path entry response wrapping `Entry`
+- `[filesystem.proto:ListRequest]`: Directory listing query message (`path`, `versions`, `refresh`)
+- `[filesystem.proto:ListResponse]`: Directory listing response containing `repeated Entry entries`
 - `[filesystem.proto:Entry]`: Path metadata record containing path, `EntryKind`, size, and optional `ObjectStat`
 - `[filesystem.proto:EntryKind]`: Enumeration of entry types (`ENTRY_KIND_UNSPECIFIED`, `ENTRY_KIND_FILE`, `ENTRY_KIND_DIRECTORY`)
 - `[filesystem.proto:ObjectStat]`: Detailed GCS object metadata including generation, etag, crc32c, and custom metadata

@@ -71,10 +71,13 @@ Single-threaded `200 MiB` (`209,715,200` bytes) object upload over UDS to `gs://
 | **Part 4: `200 MiB` Streaming Write (`1T`)** | Throughput (`p50`) | `97.88 MB/s` (`2.14 s`) | **`86.74 MB/s` (`2.42 s`)** | `1` active `UnixStream` (`4` pooled); client-streaming `Write` RPC with atomic close |
 | **Part 4: `200 MiB` `pipe_file` (`1T`)** | Throughput (`p50`) | `156.46 MB/s` (`1.34 s`) | **`88.72 MB/s` (`2.36 s`)** | `1` active `UnixStream` (`4` pooled); uses client-streaming `Write` RPC over UDS |
 
-### Note on `UnixStream` Pool Scaling at `48T`
-* **Why `48` `UnixStream`s is already 1:1 for `48T`**: In the `48T` sequential benchmark, each of the `48` reader threads opens a single long-lived server-streaming `Read` RPC (`0..20 GiB`) and is assigned its own dedicated `UnixStream` (`48` active streams across `48` `UnixStream` connections). Adding more than `48` `UnixStream`s for `48` single-stream readers leaves the extra connections idle.
-* **What governs the `48T` UDS throughput (`12.47 GB/s` vs `20.98 GB/s` Native)**:
-  1. **Protobuf + HTTP/2 + Kernel `AF_UNIX` Copy Overhead**: Every chunk downloaded from GCS by the sidecar is serialized by `prost` into a `ReadResponse` buffer, framed into HTTP/2 `DATA` frames, copied through the Linux kernel `AF_UNIX` socket buffer (`net.core.wmem_default = 208 KiB`), and decoded by `prost` on the client.
+### Note on `UnixStream` Pool Scaling at `48T` (`48` vs. `96` `UnixStream`s)
+* **Empirical Test (`48` vs. `96` `UnixStream`s at `48T`)**:
+  * `48T` with `48` `UnixStream`s (`--uds-pool-size 48`): `82.68 s`, **`12,466.95 MB/s` (`11,889.41 MiB/s`)**
+  * `48T` with `96` `UnixStream`s (`--uds-pool-size 96`): `85.02 s`, **`12,124.72 MB/s` (`11,563.03 MiB/s`)**
+* **Why `48` `UnixStream`s is already 1:1 for `48T`**: In the `48T` sequential benchmark, each of the `48` reader threads opens a single long-lived server-streaming `Read` RPC (`0..20 GiB`) and is assigned its own dedicated `UnixStream` (`48` active streams across `48` `UnixStream` connections). Adding `96` `UnixStream`s for `48` single-stream readers leaves the extra `48` connections idle.
+* **What governs the `48T` UDS throughput (`12.47 GB/s` / `~100 Gbps` vs. `20.98 GB/s` / `~168 Gbps` Native)**:
+  1. **Zero-Copy Native vs. IPC Copy/Framing Tax**: In-process Native `CachedFs` writes data to DRAM once during the GCS HTTP/TLS read and returns zero-copy `Bytes::slice` handles from `16 MiB` folios. Over UDS on the same host, every byte of the `960 GiB` payload additionally traverses: (a) server `prost` Protobuf encoding, (b) HTTP/2 `DATA` framing, (c) Linux kernel `AF_UNIX` `unix_stream_sendmsg` $\rightarrow$ `sk_buff` $\rightarrow$ `unix_stream_read_generic` copies, and (d) client HTTP/2 + `prost` decoding.
   2. **More than `48` `UnixStream`s helps only when**: (a) more than `48` client workers/threads connect concurrently, or (b) a single file read is striped across multiple parallel `Read` RPC streams.
 
 ---

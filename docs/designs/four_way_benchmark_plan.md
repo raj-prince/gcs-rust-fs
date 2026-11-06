@@ -19,12 +19,17 @@ This concurrency model reflects idiomatic application-level parallelism for each
 
 ### Repository & Execution Scope Boundary
 *   **`gcs-rust-fs` Repository (This Repository)**: Implements the core Rust HTTP client pool striping ([`src/gcs/backend.rs`](../../src/gcs/backend.rs), [`src/gcs/fs.rs`](../../src/gcs/fs.rs)), continuous sliding-window readahead and zero-copy slicing ([`src/cached.rs`](../../src/cached.rs)), UDS sidecar readahead flags and range-span dispatch ([`src/rpc/server.rs`](../../src/rpc/server.rs), [`src/bin/gcsfs_sidecar.rs`](../../src/bin/gcsfs_sidecar.rs)), and **executes only Stack 1 (Native Rust)** via [`examples/bench_live_readahead.rs`](../../examples/bench_live_readahead.rs). `gcs-rust-fs` remains a pure-Rust crate with zero Python dependencies.
+*   **`gcs-rust-fs` Repository (This Repository)**: Implements the core Rust HTTP client pool striping ([`src/gcs/backend.rs`](../../src/gcs/backend.rs), [`src/gcs/fs.rs`](../../src/gcs/fs.rs)), continuous sliding-window readahead and zero-copy slicing ([`src/cached.rs`](../../src/cached.rs)), UDS sidecar readahead flags, `RemoteFs` `UnixStream` pooling, and range-span dispatch ([`src/rpc/server.rs`](../../src/rpc/server.rs), [`src/rpc/client.rs`](../../src/rpc/client.rs), [`src/bin/gcsfs_sidecar.rs`](../../src/bin/gcsfs_sidecar.rs)), and **executes Stack 1 (Native Rust)** via [`examples/bench_live_readahead.rs`](../../examples/bench_live_readahead.rs) as well as the Rust UDS sidecar baseline via [`examples/bench_uds_readahead.rs`](../../examples/bench_uds_readahead.rs). `gcs-rust-fs` remains a pure-Rust crate with zero Python dependencies.
 *   **`gcsfs` Repository (`/home/princer_google_com/c1dev/gcsfs`)**: Houses and executes all Python benchmark runners, PyO3 bindings (`gcsfs_rust`), and UDS Python client adapters for **Stacks 2, 3, and 4**, consuming the JSON baseline artifact emitted by Stack 1.
 
 All four stacks are evaluated across an identical three-part workload suite on `gs://princer-flat/bench/bench_20GB.bin` (`US-WEST4`, `Transport::Http` for all object data reads in Workloads 2 and 3; in Workload 1, uncached `GcsFs::info` in `gcs-rust-fs` executes via the SDK's `StorageControl` gRPC metadata client whereas Pure Python `gcsfs` uses the HTTP/JSON metadata endpoint):
+All four stacks are evaluated across an identical four-part workload suite on `gs://princer-flat/bench/bench_20GB.bin` (`US-WEST4`, `Transport::Http` for all object data reads in Workloads 2 and 3; in Workload 1, uncached `GcsFs::info` in `gcs-rust-fs` executes via the SDK's `StorageControl` gRPC metadata client whereas Pure Python `gcsfs` uses the HTTP/JSON metadata endpoint):
 1.  **Uncached Metadata `info` Latency (`p50`, `p90`, `p99`, `mean`)** (direct GCS metadata round-trip with metadata caching disabled).
 2.  **Small I/O (`1 MiB`) Random Read Latency (`p50`, `p90`, `p99`, `IOPS`, `MB/s`)** over the 20 GiB file at `1` worker and `48` workers.
 3.  **Sequential Read Latency and Throughput (`p50`, `p90`, `MB/s`, `MiB/s`, wall time)** over the 20 GiB file with prefetch/readahead enabled at `1` worker (targeting `>= 2.0 GB/s`) and `48` workers (targeting host network saturation at `15–22+ GB/s`).
+2.  **Small I/O (`1 MiB`) Random Read Latency (`p50`, `p90`, `p99`, `IOPS`, `MB/s`)** over the 20 GiB file (`1T`, `50` reads).
+3.  **Sequential Read Latency and Throughput (`p50`, `p90`, `MB/s`, `MiB/s`, wall time)** over the 20 GiB file with prefetch/readahead enabled at `1` worker (`20 GiB`, targeting `>= 2.0 GB/s`), `24` workers (`480 GiB`), and `48` workers (`960 GiB`, targeting host network saturation at `15–22+ GB/s`).
+4.  **Single-Worker `200 MiB` Write Latency and Throughput (`p50`, `p90`, `MB/s`, `MiB/s`)** comparing streaming `open(write)` + `write(8 MiB)` + `close` and one-shot `pipe_file`.
 
 --------------------------------------------------------------------------------
 
@@ -108,6 +113,8 @@ Initial calibration runs on `gs://princer-bucket/bench/bench_20GB.bin` over HTTP
 In `gcs-rust-fs`, [`CachedFs`](../../src/cached.rs) supports two distinct data-path modes:
 *   **Mode 1 — Asynchronous Streaming Readahead (`Index::Private`)**: Maintains a private per-handle folio ring with drop-behind eviction (`evict_before` as the read cursor advances) and Linux-style on-demand readahead state (`ondemand_readahead` Rules 1–7).
 *   **Mode 2 — Shared Multi-Handle Page Cache (`Index::Shared` / `PageCache`)**: Shares downloaded folios across all file handles in the process using a concurrent sharded page table with CLOCK second-chance eviction bounded by a byte capacity (`page_cache_mb`).
+*   **Mode 1 — Asynchronous Streaming Readahead (`Index::Private`)**: Maintains a private per-handle folio map (`BTreeMap<u64, Arc<Folio>>`) with drop-behind eviction (`retain` as the read cursor advances) and Linux-style on-demand readahead state (`ondemand_readahead` Rules 1–7).
+*   **Mode 2 — Shared Multi-Handle Page Cache (`Index::Shared` / `PageCache`)**: Shares downloaded folios across all file handles in the process using a per-object page directory (`Mutex<HashMap<ObjectKey, Arc<ObjectPages>>>`) with a logical-tick LRU recency map (`BTreeMap<u64, (ObjectKey, u64)>`) bounded by a byte capacity (`page_cache_mb`).
 
 The benchmark harness evaluates four distinct client architectures over the **HTTP/JSON GCS data path (`Transport::Http`)** against `gs://princer-flat/bench/bench_20GB.bin` in `US-WEST4`:
 
@@ -310,15 +317,21 @@ All changes in this repository are partitioned into three incremental, self-cont
 *   **Type / Scope**: Asynchronous Readahead Engine & Page Cache (`ReadaheadFile`) + Unit Tests
 *   **Proposed Changes**:
     *   **Per-Handle In-Flight Semaphore**:
+    *   **Per-Handle In-Flight Semaphore & Eager FIFO Pacing**:
         *   Add `handle_semaphore: Arc<Semaphore>` to `ReadaheadFile`, initialized in `ReadaheadFile::new` with `Arc::new(Semaphore::new(runtime.config.max_inflight.max(1)))`, and clone the `Arc` in `ReadaheadFile::clone_handle`.
         *   In `ReadaheadFile::seek`, when a non-contiguous seek resets `self.cancel_token`, also replace `self.handle_semaphore = Arc::new(Semaphore::new(self.runtime.config.max_inflight.max(1)));` so cancelled pre-seek tasks cannot starve post-seek reads of handle permits.
         *   In `ReadaheadFile::fetch_folio_range`, clone `let handle_sem = Arc::clone(&self.handle_semaphore);` and move `handle_sem` **into the `let fut = async move { ... }` closure**. Inside `fut`, acquire `_handle_permit` before `semaphore.acquire_many(fetch_len)` and wrap both permit acquisition and `inner.read_range(range)` in `tokio::select! { biased; _ = t.cancelled() => return Err(Arc::new(Error::Cancelled)), ... }` so cancelled tasks immediately abort and release permits.
     *   **Mid-Window Readahead Marker & Post-`seek` Streaming Ramp**:
         *   In `ReadaheadFile::ondemand_readahead` (Rules 1, 2, 4, and `ReadPattern::Sequential`) and `ReadaheadFile::submit_async_readahead`, set `async_size = (count / 2).max(1)` (instead of `count`) so `readahead_mark` is placed at the midpoint of each window (`128 MiB` of a `256 MiB` window) rather than Folio 0 (`0 MiB`).
         *   In `ReadaheadFile::ondemand_readahead` under `ReadPattern::Auto`, when `ra.prev_pos == -1` and `page_idx > 0`, if `req_pages.saturating_mul(self.runtime.config.page_size) >= self.runtime.config.io_size` (e.g. `>= 8 MiB` partitioned streaming read), execute Rule 1 initial ramp (`size = get_init_ra_size(...)`, `async_size = (size / 2).max(1)`); otherwise preserve Rule 7 single-read isolation (`size = req_pages.max(1)`, `async_size = 0`) for small random reads (`64 KiB`, `1 MiB`).
+        *   In `ReadaheadFile::fetch_folio_range`, eagerly call `let handle_permit_opt = Arc::clone(&self.handle_semaphore).try_acquire_owned().ok();` synchronously on the caller thread before `tokio::spawn` to preserve strict FIFO ordering of folio fetches across concurrent background tasks, falling back to `handle_sem.acquire_owned().await` inside `fut` only when all `max_inflight` slots are busy. Wrap both permit acquisition and `inner.read_range(range)` in `tokio::select! { biased; _ = t.cancelled() => return Err(Arc::new(Error::Cancelled)), ... }` so cancelled tasks immediately abort and release permits.
+    *   **Early Readahead Marker & Post-`seek` Streaming Ramp**:
+        *   In `ReadaheadFile::ondemand_readahead` (Rules 1, 2, 4, and `ReadPattern::Sequential`) and `ReadaheadFile::submit_async_readahead`, set `async_size = count` so `readahead_mark` is placed at Folio 0 (`start`) of each window, keeping `handle_semaphore` (`max_inflight`) continuously pipelined with the next window while the reader consumes the current window.
+        *   In `ReadaheadFile::ondemand_readahead` under `ReadPattern::Auto`, when `ra.prev_pos == -1` and `page_idx > 0`, if `req_pages.saturating_mul(self.runtime.config.page_size) >= self.runtime.config.io_size` (e.g. `>= 8 MiB` partitioned streaming read), execute Rule 1 initial ramp (`size = get_init_ra_size(...)`, `async_size = size`); otherwise preserve Rule 7 single-read isolation (`size = req_pages.max(1)`, `async_size = 0`) for small random reads (`64 KiB`, `1 MiB`).
     *   **Zero-Copy Single-Folio Fast Path in `ReadaheadFile::read`**:
         *   Replace the eager `let mut buf = BytesMut::with_capacity(target_len);` before the `while` loop with `let mut buf = BytesMut::new();`.
         *   Inside the loop, when `buf.is_empty()` and the first `Ready` folio has `avail >= target_len`, slice `let out = folio_data.slice(offset_in_folio..offset_in_folio + target_len);`, update `self.pos`, `self.ra_state.lock().prev_pos`, and Mode 1 drop-behind eviction (`Index::Private`), and return `Ok(out)` immediately without allocating `BytesMut`. When `avail < target_len` (multi-folio boundary read), lazily reserve `if buf.capacity() == 0 { buf.reserve(target_len); }` and copy via `buf.extend_from_slice(...)`.
+        *   Inside the loop, when `buf.is_empty()` and the first `Ready` folio has `avail >= target_len`, slice `let out = folio_data.slice(offset_in_folio..offset_in_folio + target_len);`, update `self.pos`, `self.ra_state.lock().unwrap().prev_pos`, and Mode 1 drop-behind eviction (`Index::Private`), and return `Ok(out)` immediately without allocating `BytesMut`. When `avail < target_len` (multi-folio boundary read), lazily reserve `if buf.capacity() == 0 { buf.reserve(target_len); }` and copy via `buf.extend_from_slice(...)`.
     *   **Unit Test in [`tests/page_cache.rs`](../../tests/page_cache.rs)**:
         *   Add a deterministic test verifying that `ReadaheadFile` respects `handle_semaphore` (`max_inflight`), returns zero-copy slices on single-folio reads, and preserves `test_3_standalone_random_read_rule_7` while ramping on `>= io_size` post-`seek` reads.
 *   **Phase 1 Verification Checkpoint**:
@@ -335,10 +348,12 @@ All changes in this repository are partitioned into three incremental, self-cont
     *   In `FileSystemRpcService::read`, inspect `req.range` (`Option<proto::ByteRange>`) after converting to `range: ByteRange` and determining `chunk_size`:
         *   **Bounded Small Random Read Fast Path (`span <= 4 MiB`)**: When `req.range` has both `start` and `end: Some(end)` with `end > start` and `(end - start) <= 4 * 1024 * 1024`:
             *   If `(end - start) as usize <= chunk_size`, call `let data = self.fs.cat_file(&req.path, range).await.map_err(fs_err_to_status)?;` directly and send a single `ReadResponse { data, offset: start, eof: true }` over the stream (avoiding a separate `open()` `GetObject` metadata RPC on `1 MiB` random reads).
+            *   If `(end - start) as usize <= chunk_size`, call `let data = self.fs.cat_file(&req.path, range).await.map_err(fs_err_to_status)?;` directly and send a single `ReadResponse { data }` over the stream (avoiding a separate `open()` `GetObject` metadata RPC on `1 MiB` random reads).
             *   Otherwise (`chunk_size < span <= 4 MiB`), open with `OpenOptions::read().with_block_size(chunk_size).with_pattern(ReadPattern::Random)`.
         *   **Sequential Streaming Range (`unbounded` or `span >= 16 MiB`)**: When `req.range` is `None`, has `end: None`, or `end.saturating_sub(start) >= 16 * 1024 * 1024`, open with `OpenOptions::read().with_block_size(8 * 1024 * 1024).with_pattern(ReadPattern::Sequential)`.
         *   **Intermediate Range (`4 MiB < span < 16 MiB`)**: Open with `OpenOptions::read().with_block_size(chunk_size).with_pattern(ReadPattern::Auto)`.
     *   Increase the internal streaming `mpsc::channel` capacity in `FileSystemRpcService::read` from `4` to `16` frames so UDS socket writes pipeline ahead of `handle.read()`.
+    *   Increase the internal streaming `mpsc::channel` capacity in `FileSystemRpcService::read` from `4` to `32` frames so UDS socket writes pipeline ahead of `handle.read()`.
 *   **Rationale**: Eliminates the `(4 MiB, 16 MiB)` dead zone, avoids redundant `GetObject` metadata RPCs on `1 MiB` random UDS reads, and enables full Mode 1 readahead for `>= 16 MiB` partition scans over UDS.
 
 #### 5. [`../../src/bin/gcsfs_sidecar.rs`](../../src/bin/gcsfs_sidecar.rs) & [`../../tests/rpc.rs`](../../tests/rpc.rs) (Modify)
@@ -359,13 +374,17 @@ All changes in this repository are partitioned into three incremental, self-cont
 ### Phase 3: Stack 1 Native Rust 20 GiB Benchmark Suite (`US-WEST4`, `Transport::Http`, `ReadPattern::Auto`)
 
 #### 6. [`../../examples/bench_live_readahead.rs`](../../examples/bench_live_readahead.rs) (Modify)
+#### 6. [`../../examples/bench_live_readahead.rs`](../../examples/bench_live_readahead.rs) & [`../../examples/bench_uds_readahead.rs`](../../examples/bench_uds_readahead.rs) (Modify)
 
 *   **Type / Scope**: Stack 1 Native Rust Benchmark Binary (`1T` vs `48T`, `US-WEST4`, `Transport::Http`, `ReadPattern::Auto`)
+*   **Type / Scope**: Stack 1 Native Rust & UDS Sidecar Benchmark Binaries (`1T`, `24T`, `48T`, `US-WEST4`, `Transport::Http`, `ReadPattern::Auto`)
 *   **Proposed Changes**:
     *   **Target, Transport, & CLI Flags**:
         *   Default target URI to `gs://princer-flat/bench/bench_20GB.bin` (`US-WEST4`) and execute exclusively over `Transport::Http` using `ReadPattern::Auto`.
         *   Support `--only <all|info|random|seq|seq-1t|seq-48t>`, `--read-size-mb <MIB>` (default `8`), `--io-size-mb <MIB>` (default `16`), and `--json-out <PATH>`.
         *   Construct `gcs_http_1t` with `GcsFs::builder().transport(Transport::Http).http_pool_size(24).from_env()?.build().await?` for `1T` runs and `gcs_http_48t` with `GcsFs::builder().transport(Transport::Http).http_pool_size(48).from_env()?.build().await?` for `48T` runs, warming connection pools before timed measurement.
+        *   Support `--only <all|info|random|seq|seq-1t|seq-24t|seq-48t|write>`, `--read-size-mb <MIB>` (default `8`), `--io-size-mb <MIB>` (default `16`), and `--json-out <PATH>`.
+        *   Construct `gcs_http_1t` with `GcsFs::builder().transport(Transport::Http).http_pool_size(24).from_env()?.build().await?`, `gcs_http_24t` with `.http_pool_size(24)`, and `gcs_http_48t` with `.http_pool_size(48)`, warming connection pools before timed measurement.
     *   **Part 1 (`info` Latency — Uncached Only)**:
         *   Run only the **uncached** `Direct GcsFs::info` benchmark (`30` iterations against `gs://princer-flat/bench/bench_20GB.bin`).
     *   **Post-`open()` Readiness Barrier (`tokio::sync::Barrier`)**:
@@ -373,6 +392,11 @@ All changes in this repository are partitioned into three incremental, self-cont
     *   **Workload 2 & Workload 3 Parameter Alignment**:
         *   In Part 2 (`1 MiB` random reads, `read_size = 1 MiB`, `io_size = 1 MiB`), run `50` reads for `1T` and `480` reads (`10` per thread) for `48T` across non-overlapping `4 MiB`-aligned offsets.
         *   In Part 3 (`20 GiB` sequential read, `ReadPattern::Auto`), `1T` reads `1 × 20 GiB = 20 GiB` from `gs://princer-flat/bench/bench_20GB.bin`, and `48T` reads `48 × 20 GiB = 960 GiB` (`1.03 TB`) across 48 distinct objects (`bench_20GB_00.bin` .. `bench_20GB_47.bin`).
+        *   In `bench_random` and `bench_sequential`, have all `threads` (`1`, `24`, or `48`) open their `File` handles (`fs_c.open(...)`) *before* waiting on `Arc<tokio::sync::Barrier>::new(threads + 1)`. Record `let start = Instant::now();` in the coordinator immediately after `barrier.wait().await` releases all workers simultaneously.
+    *   **Workload 2, Workload 3, & Workload 4 Parameter Alignment**:
+        *   In Part 2 (`1 MiB` random reads, `CachedFs` Mode 1 default, `read_size = 1 MiB`, `io_size = 1 MiB`), run `50` reads for `1T`, `240` reads (`10` per thread) for `24T`, and `480` reads (`10` per thread) for `48T` across non-overlapping `4 MiB`-aligned offsets.
+        *   In Part 3 (`20 GiB` sequential read, `ReadPattern::Auto`), `1T` reads `1 × 20 GiB = 20 GiB`, `24T` reads `24 × 20 GiB = 480 GiB`, and `48T` reads `48 × 20 GiB = 960 GiB` (`1.03 TB`) across distinct objects (`bench_20GB_00.bin` .. `bench_20GB_47.bin`).
+        *   In Part 4 (`200 MiB` single-threaded write, `5` iterations), compare `CachedFs::open(WriteMode::Overwrite)` (`8 MiB` chunks) and `CachedFs::pipe_file`.
 
 --------------------------------------------------------------------------------
 

@@ -12,7 +12,9 @@ Google Cloud Storage backend implementation for `gcs-rust-fs`, implementing the 
 - `[mod.rs / fs.rs:GcsFs::bucket_kind]`: Queries and caches the `BucketKind` of a bucket.
 - `[mod.rs / fs.rs:GcsFs::create_bucket]`: Creates a bucket with custom placement and layout specifications (`BucketSpec`).
 - `[mod.rs / fs.rs:GcsFsBuilder]`: Fluent builder for `GcsFs` with options: `transport`, `endpoint`, `grpc_subchannel_count`, `project`, `bucket_kind`, `finalize_on_close`, `from_env`, and `build`.
+- `[mod.rs / fs.rs:GcsFsBuilder]`: Fluent builder for `GcsFs` with options: `transport`, `endpoint`, `grpc_subchannel_count`, `http_pool_size`, `project`, `bucket_kind`, `finalize_on_close`, `from_env`, and `build`.
 - `[mod.rs / fs.rs:PROJECT_ENV_VARS]`: Environment variable fallback array: `["GCS_RUST_FS_PROJECT", "GOOGLE_CLOUD_PROJECT"]`.
+- `[mod.rs / fs.rs:HTTP_POOL_SIZE_ENV_VAR]`: Environment variable (`"GCS_RUST_FS_HTTP_POOL_SIZE"`) configuring the number of pooled HTTP `Storage` client instances.
 - `[mod.rs / file.rs:GcsFile]`: Implementation of the `File` trait for Cloud Storage objects. Supports generation-pinned sequential reads, ranged reads, resumable uploads, and appendable zonal writes.
 - `[mod.rs / layout.rs:BucketKind]`: Classification of GCS bucket architectures: `Flat`, `Hierarchical`, and `Zonal`. Provides capability inspection methods (`is_hierarchical`, `has_versioning`, `supports_server_copy`, `supports_http`, `objects_appendable`).
 - `[mod.rs / control.rs:BucketSpec]`: Configuration struct for bucket creation (`location`, `zone`, `hierarchical`, `storage_class`).
@@ -20,6 +22,7 @@ Google Cloud Storage backend implementation for `gcs-rust-fs`, implementing the 
 
 ## Invariants
 - `[layout.rs:BucketKind]`: Flat buckets emulate directories via `/` delimiters and placeholder objects; Hierarchical buckets use real folders managed via the Storage Control API; Zonal buckets are hierarchical and appendable, require gRPC, and do not support HTTP transport or server-side copy.
+- `[fs.rs:GcsFsBuilder::build / from_env]`: `http_pool_size` must be at least `1` (`0` returns `ErrorKind::InvalidConfig`). `Backend::connect` defaults the pool size to `16` for `Transport::Http` and `1` for `Transport::Grpc`, striping `read_range_http` calls round-robin across `storage_pool`.
 - `[path.rs:Loc::parse]`: Root paths (`""`, `"/"`, `"gs://"`) map to root; bucket names cannot be empty when a key or generation is present; generations can only be specified for objects; object keys cannot start with `/` or contain empty `//` segments.
 - `[fs.rs:GcsFs::open]`: Read handles pin the object generation at open time; all subsequent reads see the same immutable snapshot even if the object is modified concurrently.
 - `[fs.rs:GcsFs::open]`: `OpenMode::Append` returns `ErrorKind::Unsupported` unless the bucket is Zonal (`objects_appendable()`).

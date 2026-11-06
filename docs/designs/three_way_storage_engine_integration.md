@@ -10,7 +10,7 @@
 
 Python [`gcsfs`](https://github.com/fsspec/gcsfs) is the standard Google Cloud Storage filesystem interface across Python data science, batch ETL, and distributed deep learning. In distributed training workloads (such as PyTorch `DataLoader` multi-worker pipelines, Ray Train, and batch ML feature extractors), clusters of worker processes stream tens of terabytes of sharded datasets and write multi-gigabyte checkpoints to and from GCS.
 
-[`gcs-rust-fs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/lib.rs) was engineered as an asynchronous Rust storage engine implementing the [`FileSystem`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/filesystem.rs) and [`File`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs) traits to replace the pure-Python `aiohttp` stack. This document evaluates three competing deployment topologies to connect `gcs-rust-fs` to Python runtimes:
+[`gcs-rust-fs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/lib.rs) was engineered as an asynchronous Rust storage engine implementing the [`FileSystem`](file:///home/princer_google_com/dev/gcs-rust-fs/src/filesystem.rs) and [`File`](file:///home/princer_google_com/dev/gcs-rust-fs/src/file.rs) traits to replace the pure-Python `aiohttp` stack. This document evaluates three competing deployment topologies to connect `gcs-rust-fs` to Python runtimes:
 1. **Candidate (A): In-Process Native PyO3 Extension (`gcsfs_rust` built in the `gcsfs` repository, depending on `gcs-rust-fs` via crates.io)**
 2. **Candidate (B): Out-of-Process UDS gRPC Sidecar Daemon**
 3. **Candidate (C): Out-of-Process Shared-Memory IPC Daemon** (evaluating POSIX `/dev/shm` circular ring buffers and anonymous `memfd_create` descriptors passed over UDS via `SCM_RIGHTS`).
@@ -119,13 +119,13 @@ The architecture maintains a strict decoupling between the pure-Rust storage eng
 
 1. **Rust Storage Engine (`gcs-rust-fs` on crates.io)**:
    * Maintained in the current repository (`raj-prince/gcs-rust-fs`).
-   * **Pure Rust, Zero Python Dependencies**: Implements [`FileSystem`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/filesystem.rs), [`File`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/file.rs), [`GcsFs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/fs.rs), and DirectPath gRPC transport. Tested independently with standard `cargo test`.
+   * **Pure Rust, Zero Python Dependencies**: Implements [`FileSystem`](file:///home/princer_google_com/dev/gcs-rust-fs/src/filesystem.rs), [`File`](file:///home/princer_google_com/dev/gcs-rust-fs/src/file.rs), [`GcsFs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/gcs/fs.rs), and DirectPath gRPC transport. Tested independently with standard `cargo test`.
    * Published as an open-source Rust crate on crates.io, consumable by any Rust systems software (e.g. data connectors, storage proxies, and native Python extensions).
 2. **PyO3 Extension & Packaging (`gcsfs_rust` in upstream `fsspec/gcsfs` repository)**:
    * Implemented and maintained directly within the official Python [`gcsfs`](https://github.com/fsspec/gcsfs) repository.
    * Pulls in `gcs-rust-fs = "0.1"` as a standard Cargo dependency.
    * Implements the PyO3 FFI bridge (`PyGcsFs`), wrapping Rust filesystem traits and error conversions.
-   * Maps GCS range requests into Rust [`ByteRange`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/range.rs) and options into [`ReadOptions`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/options.rs).
+   * Maps GCS range requests into Rust [`ByteRange`](file:///home/princer_google_com/dev/gcs-rust-fs/src/range.rs) and options into [`ReadOptions`](file:///home/princer_google_com/dev/gcs-rust-fs/src/options.rs).
    * Configures `pyproject.toml` and Maturin build backend to build and distribute native C-extension wheels (`pip install gcsfs`).
 3. **Python `gcsfs` Integration Layer (in `fsspec/gcsfs` repository)**:
    * `gcsfs.GCSFileSystem` subclasses or delegates storage operations to the embedded `gcsfs_rust.PyGcsFs`.
@@ -146,7 +146,7 @@ The architecture maintains a strict decoupling between the pure-Rust storage eng
 #### Write Path (Direct Streaming)
 1. Python passes a buffer (`bytes`, `bytearray`, or `memoryview`) to `fs.put_file(...)` or `file.write(...)`.
 2. PyO3 binds the underlying pointer without copying data, releasing the GIL.
-3. Rust's [`ResumableWriter`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/gcs/write.rs) streams the bytes directly into the GCS TLS socket in 16 MiB chunks with streaming CRC32c verification.
+3. Rust's [`ResumableWriter`](file:///home/princer_google_com/dev/gcs-rust-fs/src/gcs/write.rs) streams the bytes directly into the GCS TLS socket in 16 MiB chunks with streaming CRC32c verification.
 4. Because the memory is owned by the worker process, there is zero risk of Time-of-Check to Time-of-Use (TOCTOU) corruption from external processes.
 
 ### 4. Concurrency & Reliability Contracts
@@ -188,14 +188,16 @@ The architecture maintains a strict decoupling between the pure-Rust storage eng
 
 ### Alternative 1: Candidate (B) — Out-of-Process UDS gRPC Sidecar Daemon
 
-*   **Architecture**: Run `gcs-rust-fs` as an auxiliary daemon container in the same Kubernetes pod or VM ([`docs/designs/grpc_sidecar.md`](file:///usr/local/google/home/princer/code/gcs-rust-fs/docs/designs/grpc_sidecar.md)). Python workers connect to the daemon over a local Unix Domain Socket (UDS) and stream data using standard gRPC Protobuf messages (`ReadRequest` / `ReadResponse`).
+*   **Architecture**: Run `gcs-rust-fs` as an auxiliary daemon container in the same Kubernetes pod or VM ([`docs/designs/grpc_sidecar.md`](file:///home/princer_google_com/dev/gcs-rust-fs/docs/designs/grpc_sidecar.md)). Python workers connect to the daemon over a local Unix Domain Socket (UDS) and stream data using standard gRPC Protobuf messages (`ReadRequest` / `ReadResponse`).
+*   **Architecture**: Run `gcs-rust-fs` as an auxiliary daemon container in the same Kubernetes pod or VM ([`docs/designs/uds_server_and_thin_client.md`](file:///home/princer_google_com/dev/gcs-rust-fs/docs/designs/uds_server_and_thin_client.md)). Python workers connect to the daemon over a local Unix Domain Socket (UDS) and stream data using standard gRPC Protobuf messages (`ReadRequest` / `ReadResponse`).
 *   **Pros**:
     *   *Shared Storage Instance & In-Memory Cache*: Multiple Python DataLoader worker processes in the GKE pod connect to a single, unified `gcs-rust-fs` daemon instance. Directory listing (`DirCache`) and file metadata (`StatCache`) are cached once in daemon memory and shared across all workers, eliminating redundant GCS metadata RPCs.
     *   *Connection & Runtime Consolidation*: Centralizes GCS TCP/DirectPath connection pools and Tokio runtimes in a single daemon process. Sizing a single connection pool (e.g., 8–16 subchannels) avoids initializing 64 independent connection pools and 64 independent Tokio runtimes across 64 DataLoader workers ($64 \times 4 = 256$ connections per host).
     *   *Consolidated Authentication*: A single daemon manages OAuth2/ADC token refreshes and ALTS handshakes, eliminating the risk of 64 simultaneous workers stampeding the GCE metadata server at startup.
     *   *Language-Agnostic IPC Interface*: Non-Python clients (C++, Go) can theoretically connect to the same daemon.
 *   **Cons**:
-    *   *Throughput Bottleneck*: Empirical release benchmarks ([`examples/bench_ipc.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/examples/bench_ipc.rs)) show a single UDS socket caps at 0.90 GB/s (~7.7 Gbps). Even scaling to 16 dedicated UDS sockets caps out at **4.69 GB/s (40.3 Gbps)**—falling more than **5x below the 200 Gbps (25.0 GB/s) requirement**.
+    *   *Throughput Bottleneck*: Empirical release benchmarks ([`examples/bench_ipc.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/examples/bench_ipc.rs)) show a single UDS socket caps at 0.90 GB/s (~7.7 Gbps). Even scaling to 16 dedicated UDS sockets caps out at **4.69 GB/s (40.3 Gbps)**—falling more than **5x below the 200 Gbps (25.0 GB/s) requirement**.
+    *   *Throughput Bottleneck*: Empirical release benchmarks ([`examples/bench_ipc.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/examples/bench_ipc.rs)) show a single UDS socket caps at 0.90 GB/s (~7.7 Gbps), and scaling to 16 dedicated UDS sockets with `1 MiB` frames caps at **4.69 GB/s (40.3 Gbps)**. Even with `RemoteFs` `UnixStream` pooling (`48` concurrent UDS streams) and `8 MiB` streaming chunks ([`docs/uds_rust_fs_benchmark_report.md`](file:///home/princer_google_com/dev/gcs-rust-fs/docs/uds_rust_fs_benchmark_report.md)), end-to-end 48-thread sequential read plateaus at **12.47 GB/s (~100 Gbps)**—still ~2x below the 200 Gbps (25.0 GB/s) line-rate target (and vs **20.98 GB/s** in-process Native Rust) due to the extra UDS/Protobuf kernel-and-userspace memory copies.
     *   *Memory Bus Exhaustion*: Pushing 25 GB/s through 4–5 memory copies (GCS socket $\to$ sidecar heap $\to$ Protobuf serialization $\to$ kernel socket buffer $\to$ Python heap) consumes **100 to 125 GB/s of continuous DDR memory bus bandwidth**, starving GPU Host-to-Device transfers.
     *   *High Metadata Overhead*: Unary metadata operations (`info`) average **136.44 µs** (7,329 QPS), breaching the relaxed `<= 100 µs` target and introducing 2,564x higher latency than in-process direct FFI (0.05 µs).
     *   *Single Point of Failure (SPoF)*: A crash, deadlock, or OOM-kill of the sidecar daemon terminates storage for all 8 GPUs simultaneously, killing long-running distributed training jobs.
@@ -271,9 +273,11 @@ The implementation is partitioned across two distinct repositories following Con
 
 #### Part A: `gcs-rust-fs` (crates.io Core Storage Library)
 
-1.  **Phase 1: Pure-Rust Trait Stabilization & API Surface**: Audit [`src/lib.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/lib.rs), [`src/filesystem.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/filesystem.rs), and [`src/error.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/error.rs) to ensure all core filesystem types, metadata structs, range options, and error categories are public and well-documented. Ensure `#![forbid(unsafe_code)]` remains strictly enforced.
+1.  **Phase 1: Pure-Rust Trait Stabilization & API Surface**: Audit [`src/lib.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/lib.rs), [`src/filesystem.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/filesystem.rs), and [`src/error.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/error.rs) to ensure all core filesystem types, metadata structs, range options, and error categories are public and well-documented. Ensure `#![forbid(unsafe_code)]` remains strictly enforced.
 2.  **Phase 2: Deprecate Out-of-Process Artifacts**: In `src/bin/gcsfs_sidecar.rs`, print an stderr deprecation advisory warning: `eprintln!("WARNING: gcsfs-sidecar is deprecated. Migrate to in-process gcsfs_rust.");`. Annotate `pub mod rpc;` with `#[deprecated(note = "Sidecar RPC module is deprecated; use in-process gcsfs_rust via gcsfs")]`.
-3.  **Phase 3: Crates.io Packaging & Release**: Prepare crate metadata in [`Cargo.toml`](file:///usr/local/google/home/princer/code/gcs-rust-fs/Cargo.toml) (description, license, documentation, repository URL) and publish `gcs-rust-fs = "0.1.0"` to crates.io.
+3.  **Phase 3: Crates.io Packaging & Release**: Prepare crate metadata in [`Cargo.toml`](file:///home/princer_google_com/dev/gcs-rust-fs/Cargo.toml) (description, license, documentation, repository URL) and publish `gcs-rust-fs = "0.1.0"` to crates.io.
+2.  **Phase 2: Retain UDS Sidecar Alongside In-Process Core**: Retain [`pub mod rpc;`](file:///home/princer_google_com/dev/gcs-rust-fs/src/rpc/mod.rs) and [`src/bin/gcsfs_sidecar.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/bin/gcsfs_sidecar.rs) as supported components for out-of-process UDS deployments and sidecar benchmarking ([`docs/designs/uds_server_and_thin_client.md`](file:///home/princer_google_com/dev/gcs-rust-fs/docs/designs/uds_server_and_thin_client.md)), while exposing the zero-copy Rust core directly for in-process PyO3 integration.
+3.  **Phase 3: Crates.io Packaging & Release**: Prepare crate metadata in [`Cargo.toml`](file:///home/princer_google_com/dev/gcs-rust-fs/Cargo.toml) (description, license, documentation, repository URL) and publish `gcs-rust-fs` to crates.io.
 
 #### Part B: `fsspec/gcsfs` (Python Upstream Repository)
 
@@ -288,15 +292,17 @@ The implementation is partitioned across two distinct repositories following Con
 
 #### Repository 1: `raj-prince/gcs-rust-fs` (Pure Rust Crate)
 
-##### 1. [`Cargo.toml`](file:///usr/local/google/home/princer/code/gcs-rust-fs/Cargo.toml) (Modify)
+##### 1. [`Cargo.toml`](file:///home/princer_google_com/dev/gcs-rust-fs/Cargo.toml) (Modify)
 *   **Type / Scope**: Rust Crate Metadata
 *   **Proposed Changes**:
     *   Verify package metadata: `name = "gcs-rust-fs"`, `version = "0.1.0"`, `license = "Apache-2.0"`, `edition = "2021"`.
+    *   Verify package metadata: `name = "gcs-rust-fs"`, `version = "0.0.1"`, `license = "BSD-3-Clause"`, `edition = "2021"`.
     *   Ensure all public dependencies (`bytes`, `tokio`, `tonic`, `async-trait`) have appropriate version bounds.
     *   **Keep pure-Rust scope**: Do **not** add PyO3 or maturin dependencies here.
 *   **Rationale**: Preserves `gcs-rust-fs` as an unpolluted, zero-Python-dependency Rust library consumable anywhere in the Rust ecosystem.
 
-##### 2. [`src/lib.rs`](file:///usr/local/google/home/princer/code/gcs-rust-fs/src/lib.rs) (Modify)
+##### 2. [`src/lib.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/lib.rs) (Modify)
+##### 2. [`src/lib.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/lib.rs) (Verify)
 *   **Type / Scope**: Crate Root & Module Declarations
 *   **Proposed Changes**:
     *   Retain `#![forbid(unsafe_code)]` unconditionally.
@@ -306,15 +312,21 @@ The implementation is partitioned across two distinct repositories following Con
         pub mod rpc;
         ```
 *   **Rationale**: Enforces 100% safe Rust across the core storage engine while signaling deprecation of the out-of-process gRPC prototype.
+    *   Retain `#![forbid(unsafe_code)]` unconditionally and export `GcsFs`, `CachedFs`, `FileSystem`, `File`, and `rpc`.
+*   **Rationale**: Enforces 100% safe Rust across the core storage engine while supporting both in-process Rust/PyO3 consumers and out-of-process UDS sidecar consumers.
 
 ##### 3. `src/bin/gcsfs_sidecar.rs` (Modify)
 *   **Type / Scope**: Legacy Sidecar Binary
+##### 3. [`src/bin/gcsfs_sidecar.rs`](file:///home/princer_google_com/dev/gcs-rust-fs/src/bin/gcsfs_sidecar.rs) (Retain)
+*   **Type / Scope**: UDS Sidecar Binary
 *   **Proposed Changes**:
     *   Emit an advisory deprecation warning on startup to `stderr`:
         ```rust
         eprintln!("WARNING: gcsfs-sidecar is deprecated and will be removed in a future release. Please migrate to the in-process gcsfs-rust native extension in gcsfs.");
         ```
 *   **Rationale**: Prevents users from investing in new out-of-process sidecar deployments without breaking existing prototype evaluations.
+    *   Retain as an actively supported binary for UDS sidecar deployments (`--uds`, `--readahead`, `--page-cache-mb`, `--http-pool-size`) and sidecar vs in-process benchmarking.
+*   **Rationale**: Allows direct empirical comparison between Candidate (A) (in-process PyO3) and Candidate (B) (UDS gRPC sidecar) in the 4-way benchmark suite.
 
 ---
 
