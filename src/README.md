@@ -8,6 +8,7 @@ Pure-Rust, non-POSIX asynchronous filesystem abstractions and Google Cloud Stora
 - [bin](./bin/README.md): Sidecar daemon binary (`gcsfs-sidecar`) exposing `FileSystemRpcService` over Unix Domain Sockets or TCP.
 - [gcs](./gcs/README.md): Google Cloud Storage backend implementation (`GcsFs`, `GcsFile`, `BucketKind`, `BucketSpec`, `Transport`).
 - [rpc](./rpc/README.md): Out-of-process gRPC protocol definitions, server implementation (`FileSystemRpcService`), and client (`RemoteFs`, `RemoteFile`).
+- [metrics](./metrics.rs): Pluggable metrics recorder facade, zero-overhead default (`NoopMetricsRecorder`), and OpenTelemetry OTLP exporter (`OtlpMetricsRecorder`).
 
 ### Core Traits & Types
 - `[filesystem.rs:FileSystem]`: Asynchronous trait modeling an object-store filesystem. Requires 6 primitives (`info`, `ls`, `open`, `rm_file`, `mkdir`, `rmdir`) and provides overridable defaults for derived operations (`find`, `cat_file`, `pipe_file`, `put_file`, `get_file`, `copy_file`, `move_file`, `invalidate_cache`, `exists`, `is_file`, `is_dir`, `size`, `walk`, `du`, `glob`, `cat`, `cat_ranges`, `rm`, `copy`, `mv`, `put`).
@@ -43,6 +44,12 @@ Pure-Rust, non-POSIX asynchronous filesystem abstractions and Google Cloud Stora
 - `[options.rs:BulkOptions]`: Configuration for batch concurrent reads (`concurrency`, `on_error`).
 - `[range.rs:ByteRange]`: Half-open byte range `[start, end)` implementing Python-slice semantics and resolving against concrete object lengths.
 - `[stat.rs:ObjectStat]`: Detailed metadata container representing Cloud Storage object properties (generation, etag, crc32c, timestamps, custom metadata).
+- `[metrics.rs:MetricsRecorder]`: Abstract telemetry facade trait for recording transfer bytes, operation latencies, slice download durations, active in-flight streams, and cache hit/miss events.
+- `[metrics.rs:NoopMetricsRecorder]`: Zero-overhead default recorder implementation discarding all events.
+- `[metrics.rs:ActiveStreamGuard]`: RAII guard incrementing the active stream count on creation and decrementing on drop.
+- `[metrics.rs:Direction]`: Direction of network data transfer (`Read`, `Write`).
+- `[metrics.rs:Status]`: Outcome status of an operation or slice download (`Ok`, `Error`).
+- `[metrics/otlp.rs:OtlpMetricsRecorder]`: OpenTelemetry OTLP implementation of `MetricsRecorder` (behind `feature = "otlp"`) mapping events to standard `gcs.client.*` semantic conventions.
 - `[lib.rs:async_trait]`: Re-exported procedural macro required for `FileSystem` and `File` trait implementations.
 
 ## Invariants

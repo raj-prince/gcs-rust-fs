@@ -21,6 +21,7 @@ use crate::entry::{self, Entry};
 use crate::error::{Error, Result};
 use crate::file::File;
 use crate::filesystem::FileSystem;
+use crate::metrics::{MetricsRecorder, NoopMetricsRecorder};
 use crate::options::{
     CopyOptions, FindOptions, ListOptions, MkdirOptions, OpenMode, OpenOptions, PutOptions,
     ReadOptions, ReadPattern, RmOptions, WriteOptions,
@@ -298,17 +299,26 @@ pub struct DataRuntime {
     pub cache: Option<Arc<PageCache>>,
     /// Readahead configuration.
     pub config: ReadaheadConfig,
+    /// Metrics recorder for cache hits/misses.
+    pub metrics: Arc<dyn MetricsRecorder>,
 }
 
 impl DataRuntime {
     /// Create a new runtime from [`DataConfig`].
+    #[allow(dead_code)]
     pub fn new(config: DataConfig) -> Self {
+        Self::new_with_metrics(config, NoopMetricsRecorder::new())
+    }
+
+    /// Create a new runtime from [`DataConfig`] with a custom metrics recorder.
+    pub fn new_with_metrics(config: DataConfig, metrics: Arc<dyn MetricsRecorder>) -> Self {
         let inflight_semaphore = Arc::new(Semaphore::new(config.readahead.max_inflight_bytes));
         let cache = config.cache.map(|c| Arc::new(PageCache::new(c.capacity)));
         Self {
             inflight_semaphore,
             cache,
             config: config.readahead,
+            metrics,
         }
     }
 }
@@ -390,12 +400,17 @@ pub struct CachedFs<F> {
     negative: bool,
     populate_from_find: bool,
     data_runtime: Option<Arc<DataRuntime>>,
+    metrics: Arc<dyn MetricsRecorder>,
 }
 
 impl<F> CachedFs<F> {
     /// Wrap `inner`.
     pub fn new(inner: F, config: CacheConfig) -> Self {
         let data_runtime = config.data.map(|d| Arc::new(DataRuntime::new(d)));
+        let metrics = NoopMetricsRecorder::new();
+        let data_runtime = config
+            .data
+            .map(|d| Arc::new(DataRuntime::new_with_metrics(d, Arc::clone(&metrics))));
         Self {
             inner,
             cache: Arc::new(Mutex::new(DirCache::new(config.ttl, config.max_dirs))),
@@ -403,7 +418,27 @@ impl<F> CachedFs<F> {
             negative: config.negative,
             populate_from_find: config.populate_from_find,
             data_runtime,
+            metrics,
         }
+    }
+
+    /// Configure a custom [`MetricsRecorder`] for cache telemetry.
+    pub fn with_metrics_recorder(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        if let Some(ref current) = self.data_runtime {
+            self.data_runtime = Some(Arc::new(DataRuntime {
+                inflight_semaphore: Arc::clone(&current.inflight_semaphore),
+                cache: current.cache.clone(),
+                config: current.config.clone(),
+                metrics: Arc::clone(&metrics),
+            }));
+        }
+        self.metrics = metrics;
+        self
+    }
+
+    /// Access the registered [`MetricsRecorder`].
+    pub fn metrics(&self) -> &Arc<dyn MetricsRecorder> {
+        &self.metrics
     }
 
     /// The wrapped filesystem.
@@ -426,10 +461,12 @@ impl<F> CachedFs<F> {
 
     fn hit(&self) {
         self.counters.hits.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_cache_access(true);
     }
 
     fn miss(&self) {
         self.counters.misses.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_cache_access(false);
     }
 
     /// A file or directory was created or replaced at `key`.
@@ -485,6 +522,7 @@ impl<F: Clone> Clone for CachedFs<F> {
             negative: self.negative,
             populate_from_find: self.populate_from_find,
             data_runtime: self.data_runtime.as_ref().map(Arc::clone),
+            metrics: Arc::clone(&self.metrics),
         }
     }
 }
@@ -908,8 +946,11 @@ impl ReadaheadFile {
         };
 
         if let Some(folio) = existing {
+            self.runtime.metrics.record_cache_access(true);
             return Ok(folio);
         }
+
+        self.runtime.metrics.record_cache_access(false);
 
         // Folio is absent: decide window size and initiate fetch (and optional readahead expansion)
         self.ondemand_readahead(page_idx, req_pages)?;

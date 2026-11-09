@@ -16,6 +16,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::future::try_join_all;
@@ -29,6 +30,7 @@ use tracing::{debug, warn};
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcs::layout::BucketKind;
 use crate::gcs::path::GcsPath;
+use crate::metrics::{Direction, MetricsRecorder, NoopMetricsRecorder, Status};
 
 /// The protocol used to read object **data** from non-zonal buckets.
 ///
@@ -104,6 +106,7 @@ pub(crate) struct BackendOptions {
     pub(crate) project: Option<String>,
     pub(crate) bucket_kinds: HashMap<String, BucketKind>,
     pub(crate) finalize_on_close: bool,
+    pub(crate) metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
 /// Owns the SDK clients and implements the primitive operations the file
@@ -121,6 +124,7 @@ pub(crate) struct Backend {
     #[cfg_attr(not(google_cloud_unstable_storage_bidi), allow(dead_code))]
     finalize_on_close: bool,
     kinds: Arc<Mutex<HashMap<String, BucketKind>>>,
+    metrics: Arc<dyn MetricsRecorder>,
 }
 
 impl Backend {
@@ -160,6 +164,7 @@ impl Backend {
             try_join_all(storage_futs),
             async { control.build().await.map_err(Error::client_init) },
         )?;
+        let metrics = options.metrics.unwrap_or_else(NoopMetricsRecorder::new);
         Ok(Self {
             storage_pool: Arc::new(storage_pool),
             next_http_client: Arc::new(AtomicUsize::new(0)),
@@ -168,6 +173,7 @@ impl Backend {
             project: options.project,
             finalize_on_close: options.finalize_on_close,
             kinds: Arc::new(Mutex::new(options.bucket_kinds)),
+            metrics,
         })
     }
 
@@ -295,15 +301,22 @@ impl Backend {
         kind: BucketKind,
     ) -> Result<Reader> {
         match self.data_transport(kind) {
+        let mut reader = match self.data_transport(kind) {
             Transport::Grpc => match self.read_range_grpc(path, range.clone()).await {
                 Err(e) if Self::should_fall_back(kind, &e) => {
                     warn!(%path, error = %e, "bidi read unavailable; falling back to HTTP");
                     self.read_range_http(path, range).await
+                    self.read_range_http(path, range).await?
                 }
                 other => other,
+                other => other?,
             },
             Transport::Http => self.read_range_http(path, range).await,
         }
+            Transport::Http => self.read_range_http(path, range).await?,
+        };
+        reader.metrics = Some(Arc::clone(&self.metrics));
+        Ok(reader)
     }
 
     async fn read_range_grpc(&self, path: &GcsPath, range: ReadRange) -> Result<Reader> {
@@ -372,6 +385,13 @@ impl Backend {
             .await
             .map_err(|e| Error::storage("open", path, e))?;
         Ok((descriptor.object(), ReadHandle::Grpc(descriptor)))
+        Ok((
+            descriptor.object(),
+            ReadHandle::Grpc {
+                descriptor,
+                metrics: Arc::clone(&self.metrics),
+            },
+        ))
     }
 
     async fn open_http(&self, path: &GcsPath) -> Result<(Object, ReadHandle)> {
@@ -391,6 +411,10 @@ pub(crate) enum ReadHandle {
     /// One bidi gRPC stream; reads are multiplexed over it and may run
     /// concurrently. Dropping the handle closes the stream.
     Grpc(ObjectDescriptor),
+    Grpc {
+        descriptor: ObjectDescriptor,
+        metrics: Arc<dyn MetricsRecorder>,
+    },
     /// Each read is an independent HTTP request pinned to the opened
     /// generation. Boxed so both variants stay pointer-sized.
     Http(Box<HttpHandle>),
@@ -410,6 +434,16 @@ impl ReadHandle {
         match self {
             ReadHandle::Grpc(descriptor) => Ok(Reader::new(descriptor.read_range(range).await)),
             ReadHandle::Http(http) => http.backend.read_range_http(&http.path, range).await,
+            ReadHandle::Grpc {
+                descriptor,
+                metrics,
+            } => Ok(Reader::new(descriptor.read_range(range).await)
+                .with_metrics(Arc::clone(metrics))),
+            ReadHandle::Http(http) => {
+                let mut reader = http.backend.read_range_http(&http.path, range).await?;
+                reader.metrics = Some(Arc::clone(&http.backend.metrics));
+                Ok(reader)
+            }
         }
     }
 }
@@ -422,6 +456,7 @@ impl ReadHandle {
 pub(crate) struct Reader {
     stream: ReadObjectResponse,
     _descriptor: Option<ObjectDescriptor>,
+    metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
 impl Reader {
@@ -429,6 +464,7 @@ impl Reader {
         Self {
             stream,
             _descriptor: None,
+            metrics: None,
         }
     }
 
@@ -436,20 +472,37 @@ impl Reader {
         Self {
             stream,
             _descriptor: Some(descriptor),
+            metrics: None,
         }
+    }
+
+    pub(crate) fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Fetch the next non-empty chunk of bytes from the response stream,
     /// or `None` if the stream has completed.
     pub(crate) async fn next_chunk(&mut self, path: &GcsPath) -> Result<Option<Bytes>> {
+        let start = Instant::now();
         while let Some(chunk) = self
             .stream
             .next()
             .await
             .transpose()
             .map_err(|e| Error::storage("read", path, e))?
+            .map_err(|e| {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_operation("read_chunk", start.elapsed(), Status::Error);
+                }
+                Error::storage("read", path, e)
+            })?
         {
             if !chunk.is_empty() {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_bytes(Direction::Read, chunk.len() as u64, "read_chunk");
+                    metrics.record_operation("read_chunk", start.elapsed(), Status::Ok);
+                }
                 return Ok(Some(chunk));
             }
         }

@@ -1,6 +1,8 @@
 //! [`GcsFile`]: the [`File`] implementation for Cloud Storage.
 
 use std::io::SeekFrom;
+use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,6 +13,7 @@ use crate::file::File;
 use crate::gcs::backend::ReadHandle;
 use crate::gcs::path::GcsPath;
 use crate::gcs::write::Writer;
+use crate::metrics::{ActiveStreamGuard, Direction, MetricsRecorder, Status};
 use crate::options::OpenMode;
 use crate::range::{ByteRange, ResolvedRange};
 use crate::stat::ObjectStat;
@@ -69,6 +72,9 @@ struct WriteState {
     /// Size reported by the upload once closed.
     size: Option<u64>,
     stat: Option<ObjectStat>,
+    metrics: Arc<dyn MetricsRecorder>,
+    _stream_guard: ActiveStreamGuard,
+    start: Instant,
 }
 
 impl GcsFile {
@@ -96,6 +102,13 @@ impl GcsFile {
     }
 
     pub(crate) fn writer(path: String, mode: OpenMode, writer: Writer) -> Self {
+    pub(crate) fn writer(
+        path: String,
+        mode: OpenMode,
+        writer: Writer,
+        metrics: Arc<dyn MetricsRecorder>,
+    ) -> Self {
+        let _stream_guard = ActiveStreamGuard::new(Arc::clone(&metrics));
         Self {
             path,
             mode,
@@ -104,6 +117,9 @@ impl GcsFile {
                 writer: Some(writer),
                 size: None,
                 stat: None,
+                metrics,
+                _stream_guard,
+                start: Instant::now(),
             }),
         }
     }
@@ -265,6 +281,14 @@ impl File for GcsFile {
     async fn write(&mut self, data: Bytes) -> Result<()> {
         self.ensure_open()?;
         self.writer_mut()?.write(data).await
+        let len = data.len() as u64;
+        let res = self.writer_mut()?.write(data).await;
+        if res.is_ok() {
+            if let State::Write(w) = &self.state {
+                w.metrics.record_bytes(Direction::Write, len, "write");
+            }
+        }
+        res
     }
 
     async fn flush(&mut self) -> Result<()> {
@@ -284,6 +308,20 @@ impl File for GcsFile {
                 let finished = writer.close().await?;
                 w.size = Some(finished.size);
                 w.stat = finished.object.map(ObjectStat::from);
+                let start = w.start;
+                let metrics = Arc::clone(&w.metrics);
+                match writer.close().await {
+                    Ok(finished) => {
+                        metrics.record_operation("write", start.elapsed(), Status::Ok);
+                        w.size = Some(finished.size);
+                        w.stat = finished.object.map(ObjectStat::from);
+                    }
+                    Err(e) => {
+                        metrics.record_operation("write", start.elapsed(), Status::Error);
+                        self.closed = true;
+                        return Err(e);
+                    }
+                }
             }
         }
         self.closed = true;
@@ -296,6 +334,7 @@ impl File for GcsFile {
         }
         if let State::Write(w) = &mut self.state {
             if let Some(writer) = w.writer.take() {
+                w.metrics.record_operation("write", w.start.elapsed(), Status::Error);
                 writer.discard();
             }
         }
@@ -311,6 +350,7 @@ impl Drop for GcsFile {
     fn drop(&mut self) {
         if let State::Write(w) = &mut self.state {
             if let Some(writer) = w.writer.take() {
+                w.metrics.record_operation("write", w.start.elapsed(), Status::Error);
                 writer.discard();
             }
         }

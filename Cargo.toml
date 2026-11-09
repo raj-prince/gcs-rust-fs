@@ -43,6 +43,13 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
 base64 = "0.22"
 tracing = "0.1"
+opentelemetry = { version = "0.33", optional = true }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "grpc-tonic"], optional = true }
+
+[features]
+default = []
+otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 
 [build-dependencies]
 tonic-prost-build = "0.14"

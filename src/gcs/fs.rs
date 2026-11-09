@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -28,6 +29,9 @@ use crate::gcs::file::GcsFile;
 use crate::gcs::layout::BucketKind;
 use crate::gcs::path::{GcsPath, Loc};
 use crate::gcs::write::UploadSpec;
+use crate::metrics::{
+    ActiveStreamGuard, Direction, MetricsRecorder, NoopMetricsRecorder, Status,
+};
 use crate::options::{
     CopyOptions, FindOptions, ListOptions, MkdirOptions, OpenMode, OpenOptions, ReadOptions,
     RmOptions, WriteOptions,
@@ -62,6 +66,7 @@ pub struct GcsFsBuilder {
     project: Option<String>,
     bucket_kinds: HashMap<String, BucketKind>,
     finalize_on_close: bool,
+    metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
 impl GcsFsBuilder {
@@ -123,6 +128,15 @@ impl GcsFsBuilder {
         self
     }
 
+    /// Register a custom metrics recorder for observability, GCP Metrics Explorer,
+    /// or internal Google3 telemetry.
+    ///
+    /// If not set, defaults to [`NoopMetricsRecorder`].
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = Some(recorder);
+        self
+    }
+
     /// Fill unset options from the environment: the transport from
     /// [`Transport::ENV_VAR`], the HTTP pool size from
     /// [`HTTP_POOL_SIZE_ENV_VAR`], and the project from [`PROJECT_ENV_VARS`].
@@ -166,6 +180,7 @@ impl GcsFsBuilder {
                 "http_pool_size must be at least 1",
             ));
         }
+        let metrics = self.metrics.unwrap_or_else(NoopMetricsRecorder::new);
         let backend = Backend::connect(BackendOptions {
             transport: self.transport.unwrap_or_default(),
             endpoint: self.endpoint,
@@ -174,9 +189,11 @@ impl GcsFsBuilder {
             project: self.project,
             bucket_kinds: self.bucket_kinds,
             finalize_on_close: self.finalize_on_close,
+            metrics: Some(Arc::clone(&metrics)),
         })
         .await?;
         Ok(GcsFs { backend })
+        Ok(GcsFs { backend, metrics })
     }
 }
 
@@ -212,9 +229,15 @@ impl GcsFsBuilder {
 #[derive(Clone, Debug)]
 pub struct GcsFs {
     backend: Backend,
+    metrics: Arc<dyn MetricsRecorder>,
 }
 
 impl GcsFs {
+    /// Return the configured metrics recorder.
+    pub fn metrics(&self) -> &Arc<dyn MetricsRecorder> {
+        &self.metrics
+    }
+
     /// Start configuring a file system.
     pub fn builder() -> GcsFsBuilder {
         GcsFsBuilder::new()
@@ -514,6 +537,240 @@ impl GcsFs {
             }
         }
     }
+
+    async fn get_file_impl(&self, path: &str, local: &Path, opts: ReadOptions) -> Result<u64> {
+        let ReadOptions {
+            chunk_size,
+            concurrency,
+        } = opts;
+        if matches!(chunk_size, Some(0)) {
+            return Err(Error::invalid_config("chunk_size must be at least 1"));
+        }
+        if matches!(concurrency, Some(0)) {
+            return Err(Error::invalid_config("concurrency must be at least 1"));
+        }
+        let chunk_size = chunk_size.unwrap_or(DEFAULT_GET_CHUNK_SIZE) as u64;
+        let concurrency = concurrency.unwrap_or(DEFAULT_GET_CONCURRENCY);
+
+        let is_null = is_dev_null(local);
+        if !is_null {
+            if local.as_os_str().is_empty() || local.file_name().is_none() {
+                return Err(Error::invalid_path(
+                    &local.display().to_string(),
+                    "target path must not be empty",
+                ));
+            }
+            if local.to_str().is_some_and(|s| s.ends_with(std::path::is_separator))
+                || tokio::fs::metadata(local).await.is_ok_and(|m| m.is_dir())
+            {
+                return Err(Error::is_a_directory(&local.display().to_string()));
+            }
+        }
+
+        let (loc, kind, object) = self.object_loc(path).await?;
+        debug!(path = %loc.path(), local = %local.display(), "get_file");
+        let (meta, handle) = match self.backend.open(&object, kind).await {
+            Ok(opened) => opened,
+            Err(e) => return Err(self.refine_not_found(&loc, kind, e).await),
+        };
+        let file_size = u64::try_from(meta.size).unwrap_or(0);
+        let pinned = object.with_generation(Some(meta.generation));
+
+        let (target_file, tmp_path, mut guard) = if is_null {
+            let target_path = local.to_path_buf();
+            let target_file = tokio::task::spawn_blocking(move || -> std::io::Result<Arc<std::fs::File>> {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&target_path)?;
+                Ok(Arc::new(f))
+            })
+            .await
+            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+            .map_err(|e| Error::io("open", local.display(), e))?;
+            (target_file, local.to_path_buf(), TempFileGuard::new(None))
+        } else {
+            if let Some(parent) = local.parent().filter(|p| !p.as_os_str().is_empty()) {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| Error::io("mkdir", parent.display(), e))?;
+            }
+
+            let tmp_path = staging_path(local);
+            let guard = TempFileGuard::new(Some(tmp_path.clone()));
+            let open_tmp = tmp_path.clone();
+            let target_file = tokio::task::spawn_blocking(move || -> std::io::Result<Arc<std::fs::File>> {
+                let f = std::fs::OpenOptions::new()
+                    .read(false)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&open_tmp)?;
+                f.set_len(file_size)?;
+                Ok(Arc::new(f))
+            })
+            .await
+            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+            .map_err(|e| Error::io("create", tmp_path.display(), e))?;
+            (target_file, tmp_path, guard)
+        };
+
+        if file_size > 0 {
+            let num_slices = file_size.div_ceil(chunk_size);
+            let slices: Vec<(u64, u64)> = (0..num_slices)
+                .map(|i| {
+                    let start = i * chunk_size;
+                    let len = (file_size - start).min(chunk_size);
+                    (start, len)
+                })
+                .collect();
+
+            let loc_path = loc.path().to_string();
+            let metrics = Arc::clone(&self.metrics);
+            let mut stream = stream::iter(slices)
+                .map(|(start, len)| {
+                    let handle = handle.clone();
+                    let pinned = pinned.clone();
+                    let target_file = Arc::clone(&target_file);
+                    let loc_path = loc_path.clone();
+                    let tmp_display = tmp_path.display().to_string();
+                    let metrics = Arc::clone(&metrics);
+                    async move {
+                        let _guard = ActiveStreamGuard::new(Arc::clone(&metrics));
+                        let slice_start = Instant::now();
+                        let slice_res = async {
+                            let mut reader = handle.read_range(ReadRange::segment(start, len)).await?;
+                            let mut written_in_slice: u64 = 0;
+                            let mut buf = BytesMut::with_capacity(PWRITE_COALESCE_BYTES);
+
+                            while let Some(chunk) = reader.next_chunk(&pinned).await? {
+                                if buf.len() + chunk.len() > PWRITE_COALESCE_BYTES && !buf.is_empty() {
+                                    let offset = start + written_in_slice;
+                                    let to_write = buf.split().freeze();
+                                    let len_written = to_write.len() as u64;
+                                    let target_file = Arc::clone(&target_file);
+                                    let tmp_display = tmp_display.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        write_all_at_offset(&target_file, &to_write, offset)
+                                    })
+                                    .await
+                                    .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+                                    .map_err(|e| Error::io("write", tmp_display, e))?;
+                                    written_in_slice += len_written;
+                                }
+                                buf.extend_from_slice(&chunk);
+                            }
+
+                            if !buf.is_empty() {
+                                let offset = start + written_in_slice;
+                                let to_write = buf.split().freeze();
+                                let len_written = to_write.len() as u64;
+                                let target_file = Arc::clone(&target_file);
+                                let tmp_display = tmp_display.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    write_all_at_offset(&target_file, &to_write, offset)
+                                })
+                                .await
+                                .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+                                .map_err(|e| Error::io("write", tmp_display, e))?;
+                                written_in_slice += len_written;
+                            }
+
+                            if written_in_slice != len {
+                                return Err(Error::new(
+                                    ErrorKind::Other,
+                                    format!(
+                                        "short read in {loc_path}: expected {len} bytes at offset {start}, got {written_in_slice}"
+                                    ),
+                                ));
+                            }
+                            Ok::<(), Error>(())
+                        }
+                        .await;
+
+                        match &slice_res {
+                            Ok(()) => {
+                                metrics.record_slice_download(len, slice_start.elapsed(), Status::Ok);
+                            }
+                            Err(_) => {
+                                metrics.record_slice_download(len, slice_start.elapsed(), Status::Error);
+                            }
+                        }
+                        slice_res
+                    }
+                })
+                .buffer_unordered(concurrency);
+
+            while let Some(result) = stream.next().await {
+                result?;
+            }
+        }
+
+        drop(target_file);
+        if !is_null {
+            tokio::fs::rename(&tmp_path, local)
+                .await
+                .map_err(|e| Error::io("rename", local.display(), e))?;
+            guard.disarm();
+        }
+        Ok(file_size)
+    }
+
+    async fn put_file_impl(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<u64> {
+        if matches!(opts.block_size, Some(0)) {
+            return Err(Error::invalid_config("block_size must be at least 1"));
+        }
+        let metadata = tokio::fs::metadata(local)
+            .await
+            .map_err(|e| Error::io("stat", local.display(), e))?;
+        let file_size = metadata.len();
+        let (loc, kind, object) = self.object_loc(path).await?;
+        if kind.objects_appendable() {
+            // Appendable objects take the streaming path.
+            derived::put_file(self, local, path, opts).await?;
+            return Ok(file_size);
+        }
+        debug!(path = %loc.path(), local = %local.display(), "put_file");
+        let file = tokio::fs::File::open(local)
+            .await
+            .map_err(|e| Error::io("open", local.display(), e))?;
+        let spec = UploadSpec::from(&opts);
+        self.backend
+            .upload_file(&object, file, &spec)
+            .await
+            .map(|_| file_size)
+    }
+
+    async fn cat_file_impl(&self, path: &str, range: ByteRange, opts: ReadOptions) -> Result<Bytes> {
+        let ReadOptions {
+            chunk_size: _,
+            concurrency: _,
+        } = opts;
+        let (loc, kind, object) = self.object_loc(path).await?;
+        debug!(path = %loc.path(), ?range, "cat_file");
+        let (object, resolved) = if range.needs_size() {
+            let meta = match self.backend.get_object(&object).await {
+                Ok(meta) => meta,
+                Err(e) => return Err(self.refine_not_found(&loc, kind, e).await),
+            };
+            let size = u64::try_from(meta.size).unwrap_or(0);
+            let generation = object.generation().or(Some(meta.generation));
+            (
+                object.with_generation(generation),
+                range.resolve(Some(size))?,
+            )
+        } else {
+            (object, range.resolve(None)?)
+        };
+        let ResolvedRange::Read { range, len_hint } = resolved else {
+            return Ok(Bytes::new());
+        };
+        match self.backend.read_range(&object, range, kind).await {
+            Ok(reader) => reader.collect(len_hint, &object).await,
+            // A start at or past the end is an empty slice, not an error.
+            Err(e) if e.kind() == ErrorKind::OutOfRange => Ok(Bytes::new()),
+            Err(e) => Err(self.refine_not_found(&loc, kind, e).await),
+        }
+    }
 }
 
 /// A file entry for an object; with `versions` the path carries `#generation`.
@@ -696,6 +953,12 @@ impl FileSystem for GcsFs {
                 let spec = UploadSpec::from(&opts);
                 let writer = self.backend.start_upload(&object, &spec, kind).await?;
                 Ok(Box::new(GcsFile::writer(loc.path(), opts.mode, writer)))
+                Ok(Box::new(GcsFile::writer(
+                    loc.path(),
+                    opts.mode,
+                    writer,
+                    Arc::clone(&self.metrics),
+                )))
             }
             OpenMode::Append => {
                 if !kind.objects_appendable() {
@@ -718,6 +981,12 @@ impl FileSystem for GcsFs {
                     Err(e) => return Err(e),
                 };
                 Ok(Box::new(GcsFile::writer(loc.path(), opts.mode, writer)))
+                Ok(Box::new(GcsFile::writer(
+                    loc.path(),
+                    opts.mode,
+                    writer,
+                    Arc::clone(&self.metrics),
+                )))
             }
         }
     }
@@ -970,22 +1239,70 @@ impl FileSystem for GcsFs {
             // A start at or past the end is an empty slice, not an error.
             Err(e) if e.kind() == ErrorKind::OutOfRange => Ok(Bytes::new()),
             Err(e) => Err(self.refine_not_found(&loc, kind, e).await),
+        let start = Instant::now();
+        match self.cat_file_impl(path, range, opts).await {
+            Ok(bytes) => {
+                self.metrics
+                    .record_bytes(Direction::Read, bytes.len() as u64, "cat_file");
+                self.metrics
+                    .record_operation("cat_file", start.elapsed(), Status::Ok);
+                Ok(bytes)
+            }
+            Err(e) => {
+                self.metrics
+                    .record_operation("cat_file", start.elapsed(), Status::Error);
+                Err(e)
+            }
         }
     }
 
     async fn pipe_file(&self, path: &str, data: Bytes, opts: WriteOptions) -> Result<()> {
         let (loc, kind, object) = self.object_loc(path).await?;
         debug!(path = %loc.path(), len = data.len(), "pipe_file");
+        let start = Instant::now();
+        let _stream_guard = ActiveStreamGuard::new(Arc::clone(&self.metrics));
+        let len = data.len() as u64;
+        let (loc, kind, object) = match self.object_loc(path).await {
+            Ok(res) => res,
+            Err(e) => {
+                self.metrics.record_operation("pipe_file", start.elapsed(), Status::Error);
+                return Err(e);
+            }
+        };
+        debug!(path = %loc.path(), len, "pipe_file");
         let spec = UploadSpec::from(&opts);
         self.backend
             .upload_bytes(&object, data, &spec, kind)
             .await
             .map(drop)
+        match self.backend.upload_bytes(&object, data, &spec, kind).await {
+            Ok(_) => {
+                self.metrics.record_bytes(Direction::Write, len, "pipe_file");
+                self.metrics.record_operation("pipe_file", start.elapsed(), Status::Ok);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.record_operation("pipe_file", start.elapsed(), Status::Error);
+                Err(e)
+            }
+        }
     }
 
     async fn put_file(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<()> {
         if matches!(opts.block_size, Some(0)) {
             return Err(Error::invalid_config("block_size must be at least 1"));
+        let start = Instant::now();
+        let _stream_guard = ActiveStreamGuard::new(Arc::clone(&self.metrics));
+        match self.put_file_impl(local, path, opts).await {
+            Ok(bytes) => {
+                self.metrics.record_bytes(Direction::Write, bytes, "put_file");
+                self.metrics.record_operation("put_file", start.elapsed(), Status::Ok);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.record_operation("put_file", start.elapsed(), Status::Error);
+                Err(e)
+            }
         }
         let (loc, kind, object) = self.object_loc(path).await?;
         if kind.objects_appendable() {
@@ -1034,11 +1351,20 @@ impl FileSystem for GcsFs {
                     &local.display().to_string(),
                     "target path must not be empty",
                 ));
+        let start = Instant::now();
+        match self.get_file_impl(path, local, opts).await {
+            Ok(bytes) => {
+                self.metrics.record_bytes(Direction::Read, bytes, "get_file");
+                self.metrics.record_operation("get_file", start.elapsed(), Status::Ok);
+                Ok(())
             }
             if local.to_str().is_some_and(|s| s.ends_with(std::path::is_separator))
                 || tokio::fs::metadata(local).await.is_ok_and(|m| m.is_dir())
             {
                 return Err(Error::is_a_directory(&local.display().to_string()));
+            Err(e) => {
+                self.metrics.record_operation("get_file", start.elapsed(), Status::Error);
+                Err(e)
             }
         }
         if local.to_str().is_some_and(|s| s.ends_with(std::path::is_separator))

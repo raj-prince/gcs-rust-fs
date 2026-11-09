@@ -85,6 +85,7 @@ mod file;
 mod filesystem;
 mod gcs;
 mod glob;
+pub mod metrics;
 mod options;
 mod range;
 pub mod rpc;
@@ -98,6 +99,9 @@ pub use error::{classify_storage_error, Error, ErrorKind, Result, StorageError};
 pub use file::File;
 pub use filesystem::FileSystem;
 pub use gcs::{BucketKind, BucketSpec, GcsFile, GcsFs, GcsFsBuilder, Transport, PROJECT_ENV_VARS};
+pub use metrics::{ActiveStreamGuard, Direction, MetricsRecorder, NoopMetricsRecorder, Status};
+#[cfg(feature = "otlp")]
+pub use metrics::otlp::OtlpMetricsRecorder;
 pub use options::{
     BulkOptions, CopyOptions, DuOptions, FindOptions, GlobOptions, ListOptions, MkdirOptions,
     OnError, OpenMode, OpenOptions, PutOptions, ReadOptions, ReadPattern, RmOptions, WalkOptions,
