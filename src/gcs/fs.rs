@@ -6,12 +6,15 @@
 //! lives in the sibling modules (`backend`, `control`, `write`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, StreamExt};
 use google_cloud_storage::model::{Bucket, Folder, Object};
+use google_cloud_storage::model_ext::ReadRange;
 use tracing::{debug, warn};
 
 use crate::derived;
@@ -31,6 +34,15 @@ use crate::options::{
 };
 use crate::range::{ByteRange, ResolvedRange};
 use crate::stat::ObjectStat;
+
+/// Default slice / chunk size in bytes for parallel downloads in [`GcsFs::get_file`] (128 MiB).
+pub const DEFAULT_GET_CHUNK_SIZE: usize = 128 * 1024 * 1024;
+
+/// Default concurrency (number of in-flight byte-range requests) for [`GcsFs::get_file`].
+pub const DEFAULT_GET_CONCURRENCY: usize = 24;
+
+/// Coalescing threshold in bytes before issuing a positional disk write in [`GcsFs::get_file`] (2 MiB).
+const PWRITE_COALESCE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Environment variables consulted by [`GcsFsBuilder::from_env`] for the
 /// project, in order.
@@ -928,7 +940,12 @@ impl FileSystem for GcsFs {
     /// cost an extra `GetObject` and are then pinned to that generation.
     async fn cat_file(&self, path: &str, range: ByteRange, opts: ReadOptions) -> Result<Bytes> {
         // Destructured so a new `ReadOptions` field must be handled here.
-        let ReadOptions {} = opts;
+        // `chunk_size` and `concurrency` apply to parallel `get_file` downloads
+        // and do not affect single-range `cat_file`.
+        let ReadOptions {
+            chunk_size: _,
+            concurrency: _,
+        } = opts;
         let (loc, kind, object) = self.object_loc(path).await?;
         debug!(path = %loc.path(), ?range, "cat_file");
         let (object, resolved) = if range.needs_size() {
@@ -967,6 +984,9 @@ impl FileSystem for GcsFs {
     }
 
     async fn put_file(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<()> {
+        if matches!(opts.block_size, Some(0)) {
+            return Err(Error::invalid_config("block_size must be at least 1"));
+        }
         let (loc, kind, object) = self.object_loc(path).await?;
         if kind.objects_appendable() {
             // Appendable objects take the streaming path.
@@ -981,6 +1001,185 @@ impl FileSystem for GcsFs {
             .upload_file(&object, file, &spec)
             .await
             .map(drop)
+    }
+
+    /// Download the file at `path` to the local path `local`, creating parent
+    /// directories as needed.
+    ///
+    /// Downloads are split into parallel byte ranges according to `opts.chunk_size`
+    /// (default [`DEFAULT_GET_CHUNK_SIZE`], 64 MiB) and `opts.concurrency`
+    /// (default [`DEFAULT_GET_CHUNK_SIZE`], 128 MiB) and `opts.concurrency`
+    /// (default [`DEFAULT_GET_CONCURRENCY`], 24). Bytes stream directly to disk at
+    /// assigned offsets without buffering full slices in memory. Writes target an
+    /// ephemeral staging file (`<local>.gstmp.<pid>.<nanos>.<counter>`) that is atomically
+    /// renamed to `local` on completion and unlinked on error or cancellation.
+    async fn get_file(&self, path: &str, local: &Path, opts: ReadOptions) -> Result<()> {
+        let ReadOptions {
+            chunk_size,
+            concurrency,
+        } = opts;
+        if matches!(chunk_size, Some(0)) {
+            return Err(Error::invalid_config("chunk_size must be at least 1"));
+        }
+        if matches!(concurrency, Some(0)) {
+            return Err(Error::invalid_config("concurrency must be at least 1"));
+        }
+        let chunk_size = chunk_size.unwrap_or(DEFAULT_GET_CHUNK_SIZE) as u64;
+        let concurrency = concurrency.unwrap_or(DEFAULT_GET_CONCURRENCY);
+
+        let is_null = is_dev_null(local);
+        if !is_null {
+            if local.as_os_str().is_empty() || local.file_name().is_none() {
+                return Err(Error::invalid_path(
+                    &local.display().to_string(),
+                    "target path must not be empty",
+                ));
+            }
+            if local.to_str().is_some_and(|s| s.ends_with(std::path::is_separator))
+                || tokio::fs::metadata(local).await.is_ok_and(|m| m.is_dir())
+            {
+                return Err(Error::is_a_directory(&local.display().to_string()));
+            }
+        }
+        if local.to_str().is_some_and(|s| s.ends_with(std::path::is_separator))
+            || tokio::fs::metadata(local).await.is_ok_and(|m| m.is_dir())
+        {
+            return Err(Error::is_a_directory(&local.display().to_string()));
+        }
+
+        let (loc, kind, object) = self.object_loc(path).await?;
+        debug!(path = %loc.path(), local = %local.display(), "get_file");
+        let (meta, handle) = match self.backend.open(&object, kind).await {
+            Ok(opened) => opened,
+            Err(e) => return Err(self.refine_not_found(&loc, kind, e).await),
+        };
+        let file_size = u64::try_from(meta.size).unwrap_or(0);
+        let pinned = object.with_generation(Some(meta.generation));
+
+        let (target_file, tmp_path, mut guard) = if is_null {
+            let target_path = local.to_path_buf();
+            let target_file = tokio::task::spawn_blocking(move || -> std::io::Result<Arc<std::fs::File>> {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&target_path)?;
+                Ok(Arc::new(f))
+            })
+            .await
+            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+            .map_err(|e| Error::io("open", local.display(), e))?;
+            (target_file, local.to_path_buf(), TempFileGuard::new(None))
+        } else {
+            if let Some(parent) = local.parent().filter(|p| !p.as_os_str().is_empty()) {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| Error::io("mkdir", parent.display(), e))?;
+            }
+
+            let tmp_path = staging_path(local);
+            let guard = TempFileGuard::new(Some(tmp_path.clone()));
+            let open_tmp = tmp_path.clone();
+            let target_file = tokio::task::spawn_blocking(move || -> std::io::Result<Arc<std::fs::File>> {
+                let f = std::fs::OpenOptions::new()
+                    .read(false)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&open_tmp)?;
+                f.set_len(file_size)?;
+                Ok(Arc::new(f))
+            })
+            .await
+            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+            .map_err(|e| Error::io("create", tmp_path.display(), e))?;
+            (target_file, tmp_path, guard)
+        };
+
+        if file_size > 0 {
+            let num_slices = file_size.div_ceil(chunk_size);
+            let slices: Vec<(u64, u64)> = (0..num_slices)
+                .map(|i| {
+                    let start = i * chunk_size;
+                    let len = (file_size - start).min(chunk_size);
+                    (start, len)
+                })
+                .collect();
+
+            let loc_path = loc.path().to_string();
+            let mut stream = stream::iter(slices)
+                .map(|(start, len)| {
+                    let handle = handle.clone();
+                    let pinned = pinned.clone();
+                    let target_file = Arc::clone(&target_file);
+                    let loc_path = loc_path.clone();
+                    let tmp_display = tmp_path.display().to_string();
+                    async move {
+                        let mut reader = handle.read_range(ReadRange::segment(start, len)).await?;
+                        let mut written_in_slice: u64 = 0;
+                        let mut buf = BytesMut::with_capacity(PWRITE_COALESCE_BYTES);
+
+                        while let Some(chunk) = reader.next_chunk(&pinned).await? {
+                            if buf.len() + chunk.len() > PWRITE_COALESCE_BYTES && !buf.is_empty() {
+                                let offset = start + written_in_slice;
+                                let to_write = buf.split().freeze();
+                                let len_written = to_write.len() as u64;
+                                let target_file = Arc::clone(&target_file);
+                                let tmp_display = tmp_display.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    write_all_at_offset(&target_file, &to_write, offset)
+                                })
+                                .await
+                                .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+                                .map_err(|e| Error::io("write", tmp_display, e))?;
+                                written_in_slice += len_written;
+                            }
+                            buf.extend_from_slice(&chunk);
+                        }
+
+                        if !buf.is_empty() {
+                            let offset = start + written_in_slice;
+                            let to_write = buf.split().freeze();
+                            let len_written = to_write.len() as u64;
+                            let target_file = Arc::clone(&target_file);
+                            let tmp_display = tmp_display.clone();
+                            tokio::task::spawn_blocking(move || {
+                                write_all_at_offset(&target_file, &to_write, offset)
+                            })
+                            .await
+                            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
+                            .map_err(|e| Error::io("write", tmp_display, e))?;
+                            written_in_slice += len_written;
+                        }
+
+                        if written_in_slice != len {
+                            return Err(Error::new(
+                                ErrorKind::Other,
+                                format!(
+                                    "short read in {loc_path}: expected {len} bytes at offset {start}, got {written_in_slice}"
+                                ),
+                            ));
+                        }
+                        Ok::<(), Error>(())
+                    }
+                })
+                .buffer_unordered(concurrency);
+
+            while let Some(result) = stream.next().await {
+                result?;
+            }
+        }
+
+        drop(target_file);
+        tokio::fs::rename(&tmp_path, local)
+            .await
+            .map_err(|e| Error::io("rename", local.display(), e))?;
+        guard.disarm();
+        if !is_null {
+            tokio::fs::rename(&tmp_path, local)
+                .await
+                .map_err(|e| Error::io("rename", local.display(), e))?;
+            guard.disarm();
+        }
+        Ok(())
     }
 
     /// Server-side `RewriteObject`; not available when either side is a
@@ -1135,6 +1334,90 @@ impl FileSystem for GcsFs {
     }
 }
 
+/// Helper checking if `path` targets a platform null device (`/dev/null` or Windows `NUL`).
+fn is_dev_null(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        path == Path::new("/dev/null")
+    }
+    #[cfg(windows)]
+    {
+        path == Path::new("NUL") || path == Path::new(r"\\.\NUL")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generates an ephemeral staging path `<local>.gstmp.<pid>.<nanos>.<counter>`
+/// in the same directory as `local`.
+fn staging_path(local: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = local
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+    let tmp_name = format!("{file_name}.gstmp.{}.{nanos}.{counter}", std::process::id());
+    local.with_file_name(tmp_name)
+}
+
+/// RAII guard that unlinks a staging file on drop unless explicitly disarmed.
+struct TempFileGuard(Option<PathBuf>);
+
+impl TempFileGuard {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_all_at_offset(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at_offset(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let written = file.seek_write(buf, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        buf = &buf[written..];
+        offset += written as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_all_at_offset(_file: &std::fs::File, _buf: &[u8], _offset: u64) -> std::io::Result<()> {
+    compile_error!("unsupported platform for positional writes");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,5 +1489,100 @@ mod tests {
         let placeholder = Object::new().set_name("d/").set_size(0);
         assert!(is_placeholder(&placeholder));
         assert!(!is_placeholder(&Object::new().set_name("d/").set_size(1)));
+    }
+
+    #[test]
+    fn staging_path_is_unique_and_preserves_parent() {
+        let local = Path::new("/var/tmp/download.bin");
+        let p1 = staging_path(local);
+        let p2 = staging_path(local);
+
+        assert_ne!(p1, p2);
+        assert_eq!(p1.parent(), local.parent());
+        assert_eq!(p2.parent(), local.parent());
+
+        let f1 = p1.file_name().unwrap().to_str().unwrap();
+        let f2 = p2.file_name().unwrap().to_str().unwrap();
+        assert!(f1.starts_with("download.bin.gstmp."));
+        assert!(f2.starts_with("download.bin.gstmp."));
+    }
+
+    #[test]
+    fn temp_file_guard_drops_and_disarms() {
+        let temp_dir = std::env::temp_dir();
+        let drop_path = staging_path(&temp_dir.join("test_guard_drop.bin"));
+        std::fs::write(&drop_path, b"test-drop").unwrap();
+        assert!(drop_path.exists());
+
+        {
+            let _guard = TempFileGuard::new(Some(drop_path.clone()));
+        }
+        assert!(!drop_path.exists());
+
+        let disarm_path = staging_path(&temp_dir.join("test_guard_disarm.bin"));
+        std::fs::write(&disarm_path, b"test-disarm").unwrap();
+        assert!(disarm_path.exists());
+
+        {
+            let mut guard = TempFileGuard::new(Some(disarm_path.clone()));
+            guard.disarm();
+        }
+        assert!(disarm_path.exists());
+        let _ = std::fs::remove_file(disarm_path);
+    }
+
+    #[test]
+    fn write_all_at_offset_concurrent_disjoint_slices() {
+        let temp_dir = std::env::temp_dir();
+        let path = staging_path(&temp_dir.join("test_pwrite.bin"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(16384).unwrap();
+        let file = Arc::new(file);
+
+        let mut handles = Vec::new();
+        for i in 0..4u64 {
+            let file = Arc::clone(&file);
+            let byte = b'A' + i as u8;
+            let handle = std::thread::spawn(move || {
+                let chunk = vec![byte; 4096];
+                write_all_at_offset(&file, &chunk, i * 4096).unwrap();
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let content = std::fs::read(&path).unwrap();
+        assert_eq!(content.len(), 16384);
+        assert_eq!(&content[0..4096], &[b'A'; 4096]);
+        assert_eq!(&content[4096..8192], &[b'B'; 4096]);
+        assert_eq!(&content[8192..12288], &[b'C'; 4096]);
+        assert_eq!(&content[12288..16384], &[b'D'; 4096]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dev_null_detection() {
+        #[cfg(unix)]
+        {
+            assert!(is_dev_null(Path::new("/dev/null")));
+            assert!(!is_dev_null(Path::new("/dev/shm/file.bin")));
+            assert!(!is_dev_null(Path::new("/tmp/null")));
+        }
+        #[cfg(windows)]
+        {
+            assert!(is_dev_null(Path::new("NUL")));
+            assert!(is_dev_null(Path::new(r"\\.\NUL")));
+            assert!(!is_dev_null(Path::new(r"C:\temp\null")));
+        }
     }
 }

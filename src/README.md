@@ -34,6 +34,7 @@ Pure-Rust, non-POSIX asynchronous filesystem abstractions and Google Cloud Stora
 - `[options.rs:OpenOptions]`: Struct configuring handle creation mode (`Read`, `Write`, `Append`, `CreateNew`), block sizes, `read_pattern` (`ReadPattern`), and object metadata.
 - `[options.rs:ReadPattern]`: Access pattern hint enum (`Auto`, `Sequential`, `Random`) for `ReadaheadFile`.
 - `[options.rs:ReadOptions]`: Non-exhaustive configuration struct for file read calls.
+- `[options.rs:ReadOptions]`: Non-exhaustive configuration struct for file read and download calls (`chunk_size`, `concurrency`, `ReadOptions::new()`, `with_chunk_size()`, `with_concurrency()`).
 - `[options.rs:WriteOptions]`: Struct configuring whole-file uploads (`Overwrite` vs `Create`, MIME content type, custom metadata).
 - `[options.rs:CopyOptions]`: Configuration for copy/move operations (`recursive`, `maxdepth`, `concurrency`, `on_error`).
 - `[options.rs:RmOptions]`: Configuration for deletion operations (`recursive`, `maxdepth`, `concurrency`).

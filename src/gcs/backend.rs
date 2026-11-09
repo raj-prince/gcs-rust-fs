@@ -439,6 +439,23 @@ impl Reader {
         }
     }
 
+    /// Fetch the next non-empty chunk of bytes from the response stream,
+    /// or `None` if the stream has completed.
+    pub(crate) async fn next_chunk(&mut self, path: &GcsPath) -> Result<Option<Bytes>> {
+        while let Some(chunk) = self
+            .stream
+            .next()
+            .await
+            .transpose()
+            .map_err(|e| Error::storage("read", path, e))?
+        {
+            if !chunk.is_empty() {
+                return Ok(Some(chunk));
+            }
+        }
+        Ok(None)
+    }
+
     /// Drain the stream into a single contiguous buffer.
     ///
     /// Single-chunk responses (the common case for small ranged reads) are
@@ -449,16 +466,7 @@ impl Reader {
 
         let mut first: Option<Bytes> = None;
         let mut buffer: Option<BytesMut> = None;
-        while let Some(chunk) = self
-            .stream
-            .next()
-            .await
-            .transpose()
-            .map_err(|e| Error::storage("read", path, e))?
-        {
-            if chunk.is_empty() {
-                continue;
-            }
+        while let Some(chunk) = self.next_chunk(path).await? {
             if let Some(buffer) = buffer.as_mut() {
                 buffer.extend_from_slice(&chunk);
             } else if let Some(head) = first.take() {
@@ -549,5 +557,25 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn next_chunk_streams_chunks_and_skips_empty() {
+        let path = GcsPath::parse("gs://b/o").unwrap();
+        let mut reader = Reader::new(fake_response(&[b"hel", b"", b"lo ", b"world"]));
+
+        assert_eq!(
+            reader.next_chunk(&path).await.unwrap(),
+            Some(Bytes::from_static(b"hel"))
+        );
+        assert_eq!(
+            reader.next_chunk(&path).await.unwrap(),
+            Some(Bytes::from_static(b"lo "))
+        );
+        assert_eq!(
+            reader.next_chunk(&path).await.unwrap(),
+            Some(Bytes::from_static(b"world"))
+        );
+        assert_eq!(reader.next_chunk(&path).await.unwrap(), None);
     }
 }

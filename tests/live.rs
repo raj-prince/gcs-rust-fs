@@ -446,10 +446,56 @@ async fn streaming_open_write_then_read(fs: GcsFs, kind: BucketKind, root: Strin
         .expect("put_file");
     assert_eq!(fs.size(&remote).await.unwrap(), 12_345);
     let back = dir.join("down.bin");
+    // Download with parallel slices (4096 byte chunks = 4 slices for 12,345 bytes)
+    fs.get_file(
+        &remote,
+        &back,
+        ReadOptions::new().with_chunk_size(4096).with_concurrency(4),
+    )
+    .await
+    .expect("get_file parallel slices");
+    assert_eq!(tokio::fs::read(&back).await.unwrap(), payload(12_345));
+
+    // Verify no staging files remain
+    let mut dir_entries = tokio::fs::read_dir(&dir).await.unwrap();
+    while let Some(entry) = dir_entries.next_entry().await.unwrap() {
+        assert!(!entry.file_name().to_string_lossy().contains(".gstmp."));
+    }
+
+    // Atomic overwrite: download over an existing file
+    tokio::fs::write(&back, b"old-content-that-should-be-atomically-replaced").await.unwrap();
     fs.get_file(&remote, &back, ReadOptions::default())
         .await
-        .expect("get_file");
+        .expect("get_file overwrite");
     assert_eq!(tokio::fs::read(&back).await.unwrap(), payload(12_345));
+
+    // Download failure rollback: target file must remain unmodified on error
+    tokio::fs::write(&back, b"initial-state").await.unwrap();
+    let missing_remote = format!("{root}/stream/missing_{}.bin", run_id());
+    let err = fs
+        .get_file(&missing_remote, &back, ReadOptions::default())
+        .await
+        .expect_err("get_file missing object should fail");
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    assert_eq!(tokio::fs::read(&back).await.unwrap(), b"initial-state");
+
+    // Verify no staging files left after error
+    let mut dir_entries = tokio::fs::read_dir(&dir).await.unwrap();
+    while let Some(entry) = dir_entries.next_entry().await.unwrap() {
+        assert!(!entry.file_name().to_string_lossy().contains(".gstmp."));
+    }
+
+    // Zero-byte object download
+    let empty_remote = format!("{root}/stream/empty_{}.bin", run_id());
+    fs.pipe_file(&empty_remote, Bytes::new(), WriteOptions::default())
+        .await
+        .expect("pipe_file empty");
+    let empty_local = dir.join("empty.bin");
+    fs.get_file(&empty_remote, &empty_local, ReadOptions::default())
+        .await
+        .expect("get_file empty");
+    assert_eq!(tokio::fs::metadata(&empty_local).await.unwrap().len(), 0);
+
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 

@@ -605,7 +605,6 @@ async fn run_20gb_uds_benchmark_suite(
                     cache: None,
                 }),
             ));
-            let (remote_seq_mt, _guard) = spawn_uds_sidecar(mode1_seq_mt, 48).await?;
             let (remote_seq_mt, _guard) = spawn_uds_sidecar(mode1_seq_mt, uds_pool_size).await?;
 
             if run_seq_24t {

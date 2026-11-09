@@ -99,14 +99,37 @@ pub struct WriteOptions {
 
 /// Options for whole-file reads (`cat_file`, `get_file`).
 ///
-/// There are no per-read knobs yet; the struct exists so that future ones
-/// (parallel range requests, checksum verification, ...) can be added without
-/// changing the [`FileSystem`](crate::FileSystem) signatures. It is
-/// `#[non_exhaustive]`, so callers outside this crate construct it with
-/// [`ReadOptions::default()`] and keep compiling when fields appear.
+/// It is `#[non_exhaustive]`, so callers outside this crate construct it with
+/// [`ReadOptions::default()`] or [`ReadOptions::new()`] and keep compiling when fields appear.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadOptions {}
+pub struct ReadOptions {
+    /// Slice size in bytes for parallel ranged downloads in [`FileSystem::get_file`]
+    /// (`None` = implementation default).
+    pub chunk_size: Option<usize>,
+    /// Maximum number of concurrent byte-range requests in [`FileSystem::get_file`]
+    /// (`None` = implementation default).
+    pub concurrency: Option<usize>,
+}
+
+impl ReadOptions {
+    /// Create default read options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the target chunk / slice size in bytes for parallel downloads in [`FileSystem::get_file`].
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = Some(chunk_size);
+        self
+    }
+
+    /// Set the maximum number of concurrent requests in [`FileSystem::get_file`].
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency);
+        self
+    }
+}
 
 /// Expected access pattern for readahead tuning, analogous to `posix_fadvise`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -174,7 +197,12 @@ impl OpenOptions {
     pub fn from_read(opts: ReadOptions) -> Self {
         // Destructured rather than ignored so that adding a field to
         // `ReadOptions` fails to compile here until it is forwarded.
-        let ReadOptions {} = opts;
+        // `chunk_size` and `concurrency` govern direct-to-disk sliced reads
+        // in `get_file` and are intentionally not forwarded to `block_size`.
+        let ReadOptions {
+            chunk_size: _,
+            concurrency: _,
+        } = opts;
         Self::read()
     }
 

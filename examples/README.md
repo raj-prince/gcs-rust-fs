@@ -6,6 +6,7 @@ Command-line utilities and benchmark harnesses demonstrating integration with th
 - `examples/gcs.rs`: Interactive CLI tool for testing and interacting with Google Cloud Storage buckets (Flat, Hierarchical Namespace, and Zonal) directly or via a UDS sidecar using the `FileSystem` abstraction.
 - `examples/bench_ipc.rs`: Synthetic microbenchmark comparing in-process zero-copy memory transfer against out-of-process gRPC over Unix Domain Sockets (`FileSystemRpcService` + `RemoteFs`).
 - `examples/bench_live_readahead.rs`: Live 4-part `20 GiB` Native Rust benchmark suite (`Transport::Http`, `ReadPattern::Auto`) measuring uncached `info()`, `1 MiB` random reads, `20 GiB` sequential reads (`1T`, `24T`, `48T`), and `200 MiB` writes.
+- `examples/bench_live_readahead.rs`: Live 5-part `20 GiB` Native Rust benchmark suite (`Transport::Http`, `ReadPattern::Auto`) measuring uncached `info()`, `1 MiB` random reads, `20 GiB` sequential reads (`1T`, `24T`, `48T`), `200 MiB` writes (`open(write)`, `pipe_file`, and `put_file` from `/dev/shm`), and `20 GiB` parallel sliced download (`FileSystem::get_file` to `/dev/shm`).
 - `examples/bench_uds_readahead.rs`: Live 4-part `20 GiB` UDS benchmark suite (`RemoteFs` over `unix://` to `FileSystemRpcService` wrapping `CachedFs<GcsFs>`) measuring uncached `info()`, `1 MiB` random reads, `20 GiB` sequential reads (`1T`, `24T`, `48T` with configurable `UnixStream` pooling via `--uds-pool-size`), and `200 MiB` writes.
 
 ## Interface
@@ -37,6 +38,8 @@ Command-line utilities and benchmark harnesses demonstrating integration with th
 ### `examples/bench_live_readahead.rs`
 - `[bench_live_readahead.rs:main]`: Parses `--bench-20gb`, `--only <all|info|random|seq|seq-1t|seq-24t|seq-48t|write>`, `--read-size-mb <MIB>`, `--io-size-mb <MIB>`, `--json-out <PATH>`, and optional `[GS_PATH]` (default `gs://princer-flat/bench/bench_20GB.bin`).
 - `[bench_live_readahead.rs:run_20gb_benchmark_suite]`: Executes the 4-part live Native Rust benchmark suite using `CachedFs<GcsFs>` (`Transport::Http`, `ReadPattern::Auto`) and optionally writes a JSON summary report.
+- `[bench_live_readahead.rs:main]`: Parses `--bench-20gb`, `--only <all|info|random|seq|seq-1t|seq-24t|seq-48t|write|put|get>`, `--read-size-mb <MIB>`, `--io-size-mb <MIB>`, `--get-chunk-mb <MIB>`, `--get-concurrency <N>`, `--json-out <PATH>`, and optional `[GS_PATH]` (default `gs://princer-flat/bench/bench_20GB.bin`).
+- `[bench_live_readahead.rs:run_20gb_benchmark_suite]`: Executes the 5-part live Native Rust benchmark suite using `CachedFs<GcsFs>` and `GcsFs` (`Transport::Http`, `ReadPattern::Auto`) and optionally writes a JSON summary report.
 
 ### `examples/bench_uds_readahead.rs`
 - `[bench_uds_readahead.rs:main]`: Parses `--bench-20gb`, `--only <all|info|random|seq|seq-1t|seq-24t|seq-48t|write>`, `--read-size-mb <MIB>`, `--io-size-mb <MIB>`, `--uds-pool-size <N>` (default `48`), `--json-out <PATH>`, and optional `[GS_PATH]` (default `gs://princer-flat/bench/bench_20GB.bin`).
