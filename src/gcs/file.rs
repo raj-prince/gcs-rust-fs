@@ -101,7 +101,6 @@ impl GcsFile {
         }
     }
 
-    pub(crate) fn writer(path: String, mode: OpenMode, writer: Writer) -> Self {
     pub(crate) fn writer(
         path: String,
         mode: OpenMode,
@@ -280,7 +279,6 @@ impl File for GcsFile {
 
     async fn write(&mut self, data: Bytes) -> Result<()> {
         self.ensure_open()?;
-        self.writer_mut()?.write(data).await
         let len = data.len() as u64;
         let res = self.writer_mut()?.write(data).await;
         if res.is_ok() {
@@ -305,9 +303,6 @@ impl File for GcsFile {
         }
         if let State::Write(w) = &mut self.state {
             if let Some(writer) = w.writer.take() {
-                let finished = writer.close().await?;
-                w.size = Some(finished.size);
-                w.stat = finished.object.map(ObjectStat::from);
                 let start = w.start;
                 let metrics = Arc::clone(&w.metrics);
                 match writer.close().await {

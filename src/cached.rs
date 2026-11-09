@@ -406,7 +406,6 @@ pub struct CachedFs<F> {
 impl<F> CachedFs<F> {
     /// Wrap `inner`.
     pub fn new(inner: F, config: CacheConfig) -> Self {
-        let data_runtime = config.data.map(|d| Arc::new(DataRuntime::new(d)));
         let metrics = NoopMetricsRecorder::new();
         let data_runtime = config
             .data

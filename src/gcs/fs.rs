@@ -192,7 +192,6 @@ impl GcsFsBuilder {
             metrics: Some(Arc::clone(&metrics)),
         })
         .await?;
-        Ok(GcsFs { backend })
         Ok(GcsFs { backend, metrics })
     }
 }
@@ -952,7 +951,6 @@ impl FileSystem for GcsFs {
             OpenMode::Write | OpenMode::CreateNew => {
                 let spec = UploadSpec::from(&opts);
                 let writer = self.backend.start_upload(&object, &spec, kind).await?;
-                Ok(Box::new(GcsFile::writer(loc.path(), opts.mode, writer)))
                 Ok(Box::new(GcsFile::writer(
                     loc.path(),
                     opts.mode,
@@ -980,7 +978,6 @@ impl FileSystem for GcsFs {
                     }
                     Err(e) => return Err(e),
                 };
-                Ok(Box::new(GcsFile::writer(loc.path(), opts.mode, writer)))
                 Ok(Box::new(GcsFile::writer(
                     loc.path(),
                     opts.mode,
@@ -1208,37 +1205,6 @@ impl FileSystem for GcsFs {
     /// One ranged read; ranges mixing a negative bound with another bound
     /// cost an extra `GetObject` and are then pinned to that generation.
     async fn cat_file(&self, path: &str, range: ByteRange, opts: ReadOptions) -> Result<Bytes> {
-        // Destructured so a new `ReadOptions` field must be handled here.
-        // `chunk_size` and `concurrency` apply to parallel `get_file` downloads
-        // and do not affect single-range `cat_file`.
-        let ReadOptions {
-            chunk_size: _,
-            concurrency: _,
-        } = opts;
-        let (loc, kind, object) = self.object_loc(path).await?;
-        debug!(path = %loc.path(), ?range, "cat_file");
-        let (object, resolved) = if range.needs_size() {
-            let meta = match self.backend.get_object(&object).await {
-                Ok(meta) => meta,
-                Err(e) => return Err(self.refine_not_found(&loc, kind, e).await),
-            };
-            let size = u64::try_from(meta.size).unwrap_or(0);
-            let generation = object.generation().or(Some(meta.generation));
-            (
-                object.with_generation(generation),
-                range.resolve(Some(size))?,
-            )
-        } else {
-            (object, range.resolve(None)?)
-        };
-        let ResolvedRange::Read { range, len_hint } = resolved else {
-            return Ok(Bytes::new());
-        };
-        match self.backend.read_range(&object, range, kind).await {
-            Ok(reader) => reader.collect(len_hint, &object).await,
-            // A start at or past the end is an empty slice, not an error.
-            Err(e) if e.kind() == ErrorKind::OutOfRange => Ok(Bytes::new()),
-            Err(e) => Err(self.refine_not_found(&loc, kind, e).await),
         let start = Instant::now();
         match self.cat_file_impl(path, range, opts).await {
             Ok(bytes) => {
@@ -1257,8 +1223,6 @@ impl FileSystem for GcsFs {
     }
 
     async fn pipe_file(&self, path: &str, data: Bytes, opts: WriteOptions) -> Result<()> {
-        let (loc, kind, object) = self.object_loc(path).await?;
-        debug!(path = %loc.path(), len = data.len(), "pipe_file");
         let start = Instant::now();
         let _stream_guard = ActiveStreamGuard::new(Arc::clone(&self.metrics));
         let len = data.len() as u64;
@@ -1271,10 +1235,6 @@ impl FileSystem for GcsFs {
         };
         debug!(path = %loc.path(), len, "pipe_file");
         let spec = UploadSpec::from(&opts);
-        self.backend
-            .upload_bytes(&object, data, &spec, kind)
-            .await
-            .map(drop)
         match self.backend.upload_bytes(&object, data, &spec, kind).await {
             Ok(_) => {
                 self.metrics.record_bytes(Direction::Write, len, "pipe_file");
@@ -1289,8 +1249,6 @@ impl FileSystem for GcsFs {
     }
 
     async fn put_file(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<()> {
-        if matches!(opts.block_size, Some(0)) {
-            return Err(Error::invalid_config("block_size must be at least 1"));
         let start = Instant::now();
         let _stream_guard = ActiveStreamGuard::new(Arc::clone(&self.metrics));
         match self.put_file_impl(local, path, opts).await {
@@ -1304,53 +1262,18 @@ impl FileSystem for GcsFs {
                 Err(e)
             }
         }
-        let (loc, kind, object) = self.object_loc(path).await?;
-        if kind.objects_appendable() {
-            // Appendable objects take the streaming path.
-            return derived::put_file(self, local, path, opts).await;
-        }
-        debug!(path = %loc.path(), local = %local.display(), "put_file");
-        let file = tokio::fs::File::open(local)
-            .await
-            .map_err(|e| Error::io("open", local.display(), e))?;
-        let spec = UploadSpec::from(&opts);
-        self.backend
-            .upload_file(&object, file, &spec)
-            .await
-            .map(drop)
     }
 
     /// Download the file at `path` to the local path `local`, creating parent
     /// directories as needed.
     ///
     /// Downloads are split into parallel byte ranges according to `opts.chunk_size`
-    /// (default [`DEFAULT_GET_CHUNK_SIZE`], 64 MiB) and `opts.concurrency`
     /// (default [`DEFAULT_GET_CHUNK_SIZE`], 128 MiB) and `opts.concurrency`
     /// (default [`DEFAULT_GET_CONCURRENCY`], 24). Bytes stream directly to disk at
     /// assigned offsets without buffering full slices in memory. Writes target an
     /// ephemeral staging file (`<local>.gstmp.<pid>.<nanos>.<counter>`) that is atomically
     /// renamed to `local` on completion and unlinked on error or cancellation.
     async fn get_file(&self, path: &str, local: &Path, opts: ReadOptions) -> Result<()> {
-        let ReadOptions {
-            chunk_size,
-            concurrency,
-        } = opts;
-        if matches!(chunk_size, Some(0)) {
-            return Err(Error::invalid_config("chunk_size must be at least 1"));
-        }
-        if matches!(concurrency, Some(0)) {
-            return Err(Error::invalid_config("concurrency must be at least 1"));
-        }
-        let chunk_size = chunk_size.unwrap_or(DEFAULT_GET_CHUNK_SIZE) as u64;
-        let concurrency = concurrency.unwrap_or(DEFAULT_GET_CONCURRENCY);
-
-        let is_null = is_dev_null(local);
-        if !is_null {
-            if local.as_os_str().is_empty() || local.file_name().is_none() {
-                return Err(Error::invalid_path(
-                    &local.display().to_string(),
-                    "target path must not be empty",
-                ));
         let start = Instant::now();
         match self.get_file_impl(path, local, opts).await {
             Ok(bytes) => {
@@ -1358,154 +1281,11 @@ impl FileSystem for GcsFs {
                 self.metrics.record_operation("get_file", start.elapsed(), Status::Ok);
                 Ok(())
             }
-            if local.to_str().is_some_and(|s| s.ends_with(std::path::is_separator))
-                || tokio::fs::metadata(local).await.is_ok_and(|m| m.is_dir())
-            {
-                return Err(Error::is_a_directory(&local.display().to_string()));
             Err(e) => {
                 self.metrics.record_operation("get_file", start.elapsed(), Status::Error);
                 Err(e)
             }
         }
-        if local.to_str().is_some_and(|s| s.ends_with(std::path::is_separator))
-            || tokio::fs::metadata(local).await.is_ok_and(|m| m.is_dir())
-        {
-            return Err(Error::is_a_directory(&local.display().to_string()));
-        }
-
-        let (loc, kind, object) = self.object_loc(path).await?;
-        debug!(path = %loc.path(), local = %local.display(), "get_file");
-        let (meta, handle) = match self.backend.open(&object, kind).await {
-            Ok(opened) => opened,
-            Err(e) => return Err(self.refine_not_found(&loc, kind, e).await),
-        };
-        let file_size = u64::try_from(meta.size).unwrap_or(0);
-        let pinned = object.with_generation(Some(meta.generation));
-
-        let (target_file, tmp_path, mut guard) = if is_null {
-            let target_path = local.to_path_buf();
-            let target_file = tokio::task::spawn_blocking(move || -> std::io::Result<Arc<std::fs::File>> {
-                let f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&target_path)?;
-                Ok(Arc::new(f))
-            })
-            .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
-            .map_err(|e| Error::io("open", local.display(), e))?;
-            (target_file, local.to_path_buf(), TempFileGuard::new(None))
-        } else {
-            if let Some(parent) = local.parent().filter(|p| !p.as_os_str().is_empty()) {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| Error::io("mkdir", parent.display(), e))?;
-            }
-
-            let tmp_path = staging_path(local);
-            let guard = TempFileGuard::new(Some(tmp_path.clone()));
-            let open_tmp = tmp_path.clone();
-            let target_file = tokio::task::spawn_blocking(move || -> std::io::Result<Arc<std::fs::File>> {
-                let f = std::fs::OpenOptions::new()
-                    .read(false)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&open_tmp)?;
-                f.set_len(file_size)?;
-                Ok(Arc::new(f))
-            })
-            .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
-            .map_err(|e| Error::io("create", tmp_path.display(), e))?;
-            (target_file, tmp_path, guard)
-        };
-
-        if file_size > 0 {
-            let num_slices = file_size.div_ceil(chunk_size);
-            let slices: Vec<(u64, u64)> = (0..num_slices)
-                .map(|i| {
-                    let start = i * chunk_size;
-                    let len = (file_size - start).min(chunk_size);
-                    (start, len)
-                })
-                .collect();
-
-            let loc_path = loc.path().to_string();
-            let mut stream = stream::iter(slices)
-                .map(|(start, len)| {
-                    let handle = handle.clone();
-                    let pinned = pinned.clone();
-                    let target_file = Arc::clone(&target_file);
-                    let loc_path = loc_path.clone();
-                    let tmp_display = tmp_path.display().to_string();
-                    async move {
-                        let mut reader = handle.read_range(ReadRange::segment(start, len)).await?;
-                        let mut written_in_slice: u64 = 0;
-                        let mut buf = BytesMut::with_capacity(PWRITE_COALESCE_BYTES);
-
-                        while let Some(chunk) = reader.next_chunk(&pinned).await? {
-                            if buf.len() + chunk.len() > PWRITE_COALESCE_BYTES && !buf.is_empty() {
-                                let offset = start + written_in_slice;
-                                let to_write = buf.split().freeze();
-                                let len_written = to_write.len() as u64;
-                                let target_file = Arc::clone(&target_file);
-                                let tmp_display = tmp_display.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    write_all_at_offset(&target_file, &to_write, offset)
-                                })
-                                .await
-                                .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
-                                .map_err(|e| Error::io("write", tmp_display, e))?;
-                                written_in_slice += len_written;
-                            }
-                            buf.extend_from_slice(&chunk);
-                        }
-
-                        if !buf.is_empty() {
-                            let offset = start + written_in_slice;
-                            let to_write = buf.split().freeze();
-                            let len_written = to_write.len() as u64;
-                            let target_file = Arc::clone(&target_file);
-                            let tmp_display = tmp_display.clone();
-                            tokio::task::spawn_blocking(move || {
-                                write_all_at_offset(&target_file, &to_write, offset)
-                            })
-                            .await
-                            .map_err(|e| Error::new(ErrorKind::Other, format!("join error: {e}")))?
-                            .map_err(|e| Error::io("write", tmp_display, e))?;
-                            written_in_slice += len_written;
-                        }
-
-                        if written_in_slice != len {
-                            return Err(Error::new(
-                                ErrorKind::Other,
-                                format!(
-                                    "short read in {loc_path}: expected {len} bytes at offset {start}, got {written_in_slice}"
-                                ),
-                            ));
-                        }
-                        Ok::<(), Error>(())
-                    }
-                })
-                .buffer_unordered(concurrency);
-
-            while let Some(result) = stream.next().await {
-                result?;
-            }
-        }
-
-        drop(target_file);
-        tokio::fs::rename(&tmp_path, local)
-            .await
-            .map_err(|e| Error::io("rename", local.display(), e))?;
-        guard.disarm();
-        if !is_null {
-            tokio::fs::rename(&tmp_path, local)
-                .await
-                .map_err(|e| Error::io("rename", local.display(), e))?;
-            guard.disarm();
-        }
-        Ok(())
     }
 
     /// Server-side `RewriteObject`; not available when either side is a

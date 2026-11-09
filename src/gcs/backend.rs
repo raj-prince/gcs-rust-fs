@@ -300,19 +300,14 @@ impl Backend {
         range: ReadRange,
         kind: BucketKind,
     ) -> Result<Reader> {
-        match self.data_transport(kind) {
         let mut reader = match self.data_transport(kind) {
             Transport::Grpc => match self.read_range_grpc(path, range.clone()).await {
                 Err(e) if Self::should_fall_back(kind, &e) => {
                     warn!(%path, error = %e, "bidi read unavailable; falling back to HTTP");
-                    self.read_range_http(path, range).await
                     self.read_range_http(path, range).await?
                 }
-                other => other,
                 other => other?,
             },
-            Transport::Http => self.read_range_http(path, range).await,
-        }
             Transport::Http => self.read_range_http(path, range).await?,
         };
         reader.metrics = Some(Arc::clone(&self.metrics));
@@ -384,7 +379,6 @@ impl Backend {
             .send()
             .await
             .map_err(|e| Error::storage("open", path, e))?;
-        Ok((descriptor.object(), ReadHandle::Grpc(descriptor)))
         Ok((
             descriptor.object(),
             ReadHandle::Grpc {
@@ -410,7 +404,6 @@ impl Backend {
 pub(crate) enum ReadHandle {
     /// One bidi gRPC stream; reads are multiplexed over it and may run
     /// concurrently. Dropping the handle closes the stream.
-    Grpc(ObjectDescriptor),
     Grpc {
         descriptor: ObjectDescriptor,
         metrics: Arc<dyn MetricsRecorder>,
@@ -432,8 +425,6 @@ impl ReadHandle {
     /// Start reading `range`. The handle must outlive the returned [`Reader`].
     pub(crate) async fn read_range(&self, range: ReadRange) -> Result<Reader> {
         match self {
-            ReadHandle::Grpc(descriptor) => Ok(Reader::new(descriptor.read_range(range).await)),
-            ReadHandle::Http(http) => http.backend.read_range_http(&http.path, range).await,
             ReadHandle::Grpc {
                 descriptor,
                 metrics,
@@ -490,7 +481,6 @@ impl Reader {
             .next()
             .await
             .transpose()
-            .map_err(|e| Error::storage("read", path, e))?
             .map_err(|e| {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_operation("read_chunk", start.elapsed(), Status::Error);
