@@ -218,14 +218,16 @@ mod tests {
         recorder.record_bytes(Direction::Read, 1024 * 1024, "get_file");
         recorder.record_bytes(Direction::Read, 512 * 1024, "cat_file");
         recorder.record_bytes(Direction::Write, 2 * 1024 * 1024, "put_file");
+        recorder.record_bytes(Direction::Write, 200 * 1024 * 1024, "put_file_composite");
 
         assert_eq!(mock.read_bytes.load(Ordering::SeqCst), 1536 * 1024);
-        assert_eq!(mock.write_bytes.load(Ordering::SeqCst), 2 * 1024 * 1024);
+        assert_eq!(mock.write_bytes.load(Ordering::SeqCst), 202 * 1024 * 1024);
 
         recorder.record_operation("get_file", Duration::from_millis(100), Status::Ok);
         recorder.record_operation("cat_file", Duration::from_millis(30), Status::Error);
+        recorder.record_operation("put_file_composite", Duration::from_millis(1200), Status::Ok);
 
-        assert_eq!(mock.op_count.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.op_count.load(Ordering::SeqCst), 3);
         assert_eq!(mock.op_errors.load(Ordering::SeqCst), 1);
     }
 

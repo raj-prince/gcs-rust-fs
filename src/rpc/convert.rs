@@ -156,6 +156,9 @@ impl From<&proto::WriteSpec> for WriteOptions {
             content_type: spec.content_type.clone(),
             metadata: spec.metadata.clone(),
             block_size: spec.block_size.and_then(|b| usize::try_from(b).ok()),
+            chunk_size: None,
+            concurrency: None,
+            composite_threshold: None,
         }
     }
 }

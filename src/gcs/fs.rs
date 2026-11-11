@@ -231,6 +231,11 @@ pub struct GcsFs {
     metrics: Arc<dyn MetricsRecorder>,
 }
 
+struct PutOutcome {
+    bytes: u64,
+    composite: bool,
+}
+
 impl GcsFs {
     /// Return the configured metrics recorder.
     pub fn metrics(&self) -> &Arc<dyn MetricsRecorder> {
@@ -714,7 +719,7 @@ impl GcsFs {
         Ok(file_size)
     }
 
-    async fn put_file_impl(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<u64> {
+    async fn put_file_impl(&self, local: &Path, path: &str, opts: WriteOptions) -> Result<PutOutcome> {
         if matches!(opts.block_size, Some(0)) {
             return Err(Error::invalid_config("block_size must be at least 1"));
         }
@@ -726,17 +731,38 @@ impl GcsFs {
         if kind.objects_appendable() {
             // Appendable objects take the streaming path.
             derived::put_file(self, local, path, opts).await?;
-            return Ok(file_size);
+            return Ok(PutOutcome {
+                bytes: file_size,
+                composite: false,
+            });
         }
         debug!(path = %loc.path(), local = %local.display(), "put_file");
-        let file = tokio::fs::File::open(local)
-            .await
-            .map_err(|e| Error::io("open", local.display(), e))?;
         let spec = UploadSpec::from(&opts);
-        self.backend
-            .upload_file(&object, file, &spec)
-            .await
-            .map(|_| file_size)
+
+        let composite_threshold = opts
+            .composite_threshold
+            .unwrap_or(crate::gcs::write::DEFAULT_COMPOSITE_THRESHOLD as usize) as u64;
+
+        if file_size >= composite_threshold && kind.supports_server_copy() {
+            self.backend
+                .upload_composite_file(&object, local, file_size, &spec, &opts)
+                .await
+                .map(|_| PutOutcome {
+                    bytes: file_size,
+                    composite: true,
+                })
+        } else {
+            let file = tokio::fs::File::open(local)
+                .await
+                .map_err(|e| Error::io("open", local.display(), e))?;
+            self.backend
+                .upload_file(&object, file, &spec)
+                .await
+                .map(|_| PutOutcome {
+                    bytes: file_size,
+                    composite: false,
+                })
+        }
     }
 
     async fn cat_file_impl(&self, path: &str, range: ByteRange, opts: ReadOptions) -> Result<Bytes> {
@@ -1252,9 +1278,14 @@ impl FileSystem for GcsFs {
         let start = Instant::now();
         let _stream_guard = ActiveStreamGuard::new(Arc::clone(&self.metrics));
         match self.put_file_impl(local, path, opts).await {
-            Ok(bytes) => {
-                self.metrics.record_bytes(Direction::Write, bytes, "put_file");
-                self.metrics.record_operation("put_file", start.elapsed(), Status::Ok);
+            Ok(outcome) => {
+                let op = if outcome.composite {
+                    "put_file_composite"
+                } else {
+                    "put_file"
+                };
+                self.metrics.record_bytes(Direction::Write, outcome.bytes, op);
+                self.metrics.record_operation(op, start.elapsed(), Status::Ok);
                 Ok(())
             }
             Err(e) => {

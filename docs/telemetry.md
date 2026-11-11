@@ -38,7 +38,7 @@ When using `OtlpMetricsRecorder` (gated by `feature = "otlp"`), metrics conform 
 
 | Metric Name | Type | Unit | Attributes / Labels | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `gcs.client.network.io` | Counter (`u64`) | `By` (bytes) | `direction`: `read` \| `write`<br>`operation`: `get_file`, `put_file`, `cat_file`, `pipe_file`, `write`, `read_chunk` | Total volume of network bytes transferred. |
+| `gcs.client.network.io` | Counter (`u64`) | `By` (bytes) | `direction`: `read` \| `write`<br>`operation`: `get_file`, `put_file`, `put_file_composite`, `cat_file`, `pipe_file`, `write`, `read_chunk` | Total volume of network bytes transferred. |
 | `gcs.client.operation.duration` | Histogram (`f64`) | `s` (seconds) | `operation`: operation identifier<br>`status`: `ok` \| `error` | End-to-end operation latency. |
 | `gcs.client.slice.duration` | Histogram (`f64`) | `s` (seconds) | `status`: `ok` \| `error`<br>`bytes`: slice byte length | Latency of individual parallel slice downloads in `get_file`. |
 | `gcs.client.active_streams` | UpDownCounter (`i64`) | `{stream}` | None | Current number of in-flight network transfer streams. |

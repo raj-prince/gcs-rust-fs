@@ -462,6 +462,48 @@ async fn streaming_open_write_then_read(fs: GcsFs, kind: BucketKind, root: Strin
         assert!(!entry.file_name().to_string_lossy().contains(".gstmp."));
     }
 
+    // Parallel composite upload test (only on buckets supporting composition)
+    if kind.supports_server_copy() {
+        let comp_remote = format!("{root}/stream/composite_up_{}.bin", run_id());
+        let comp_opts = WriteOptions::new()
+            .with_composite_threshold(4096)
+            .with_chunk_size(2048)
+            .with_concurrency(4);
+
+        fs.put_file(&local, &comp_remote, comp_opts)
+            .await
+            .expect("put_file parallel composite upload");
+        assert_eq!(fs.size(&comp_remote).await.unwrap(), 12_345);
+        let read_back = fs
+            .cat_file(&comp_remote, ByteRange::default(), ReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(read_back, payload(12_345));
+
+        // CreateNew race prevention: trying to composite-upload with WriteMode::Create
+        // over existing object must fail with AlreadyExists
+        let create_only_opts = WriteOptions::new()
+            .with_mode(WriteMode::Create)
+            .with_composite_threshold(4096)
+            .with_chunk_size(2048)
+            .with_concurrency(4);
+        let err = fs
+            .put_file(&local, &comp_remote, create_only_opts)
+            .await
+            .expect_err("composite upload with Create over existing object should fail");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+
+        // Verify no leftover .gstmp. objects in remote bucket
+        let found = fs.find(&root, FindOptions::default()).await.unwrap();
+        for item in found {
+            assert!(
+                !item.path.contains(".gstmp."),
+                "found leftover temporary composite part: {:?}",
+                item
+            );
+        }
+    }
+
     // Atomic overwrite: download over an existing file
     tokio::fs::write(&back, b"old-content-that-should-be-atomically-replaced").await.unwrap();
     fs.get_file(&remote, &back, ReadOptions::default())

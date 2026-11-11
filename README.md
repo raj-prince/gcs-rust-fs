@@ -59,7 +59,7 @@ Every `fsspec` operation that `gcsfs` needs, behind the `FileSystem` trait:
 | metadata | `info`, `exists`, `is_file`, `is_dir`, `size` | `GetObject` **and** a directory probe issued concurrently (like gcsfs); `GetBucket` / `GetFolder` where applicable |
 | listing | `ls`, `find`, `walk`, `du`, `glob` | one `ListObjects` page stream per call (`find` is a single flat listing, not a walk); HNS folders via `ListFolders` |
 | reading | `cat_file`, `cat`, `cat_ranges`, `open(rb)` → `read`/`seek`/`read_range`, `get_file` | gRPC `BidiReadObject` or JSON API ([Transports](#transports)); read handles pin one generation |
-| writing | `pipe_file`, `put_file`, `put`, `open(wb/xb)` → `write`/`flush`/`close` | resumable `WriteObject` streamed from a spawned task; zonal buckets use appendable objects |
+| writing | `pipe_file`, `put_file`, `put`, `open(wb/xb)` → `write`/`flush`/`close` | parallel composite uploads for files $\ge 64\text{ MiB}$ via `put_file`; resumable `WriteObject` streamed from a spawned task; zonal buckets use appendable objects |
 | copy / move | `copy_file`, `copy`, `move_file`, `mv` | server-side `RewriteObject`; atomic `MoveObject` in one bucket; HNS directories renamed with `RenameFolder` |
 | delete | `rm_file`, `rm`, `rmdir` | one listing + concurrent `DeleteObject`; folders deepest-first; bucket deletion for `rm -r bucket` |
 | directories | `mkdir`, `rmdir`, `GcsFs::create_bucket` | buckets, `dir/` placeholders (flat), real folders (HNS) |
@@ -87,6 +87,16 @@ Other design points:
   negative bounds count from the end, past-the-end reads are empty. Ranges the
   API supports natively (absolute offsets, `head(n)`, `tail(n)`) never cost an
   extra request; only mixed negative bounds trigger one `GetObject`.
+* **Parallel composite upload (`put_file`).** Files $\ge 64\text{ MiB}$ uploaded via
+  `FileSystem::put_file` to composite-capable buckets (flat and hierarchical) automatically
+  split into up to 32 balanced component slices streamed concurrently (`FileSliceSource`)
+  using positional reads without in-memory buffering. Upon completion, parts are
+  atomically composed on the server via `StorageControl::compose_object` with precondition
+  matching (`WriteMode::Create` / `CreateNew`), and temporary components are cleaned up
+  automatically via `CompositeUploadGuard`. Smaller files (< 64 MiB) and zonal buckets
+  stream directly via single-stream uploads. Slicing threshold, chunk size, and concurrency
+  can be configured via `WriteOptions::with_composite_threshold`, `with_chunk_size`, and
+  `with_concurrency`.
 * **Typed errors.** Every `Error` has an `ErrorKind` (`NotFound`,
   `IsADirectory`, `AlreadyExists`, `DirectoryNotEmpty`, `Unsupported`, ...)
   classified from the gRPC status *or* HTTP status, so bridges never

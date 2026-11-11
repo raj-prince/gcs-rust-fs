@@ -95,6 +95,46 @@ pub struct WriteOptions {
     pub metadata: HashMap<String, String>,
     /// Upload chunk / buffer size hint in bytes (`None` = implementation default).
     pub block_size: Option<usize>,
+    /// Target component / slice size in bytes for parallel composite uploads in [`FileSystem::put_file`]
+    /// (`None` = implementation default, 64 MiB).
+    pub chunk_size: Option<usize>,
+    /// Maximum number of concurrent component upload requests in [`FileSystem::put_file`]
+    /// (`None` = implementation default, 8).
+    pub concurrency: Option<usize>,
+    /// Threshold file size in bytes at which composite upload is triggered in [`FileSystem::put_file`]
+    /// (`None` = implementation default, 64 MiB).
+    pub composite_threshold: Option<usize>,
+}
+
+impl WriteOptions {
+    /// Create default write options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the write mode (e.g. [`WriteMode::Overwrite`] or [`WriteMode::Create`]).
+    pub fn with_mode(mut self, mode: WriteMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the target component / slice size in bytes for parallel composite uploads in [`FileSystem::put_file`].
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = Some(chunk_size);
+        self
+    }
+
+    /// Set the maximum number of concurrent requests in [`FileSystem::put_file`].
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency);
+        self
+    }
+
+    /// Set the file size threshold in bytes to trigger parallel composite uploads in [`FileSystem::put_file`].
+    pub fn with_composite_threshold(mut self, threshold: usize) -> Self {
+        self.composite_threshold = Some(threshold);
+        self
+    }
 }
 
 /// Options for whole-file reads (`cat_file`, `get_file`).
@@ -419,6 +459,17 @@ mod tests {
         assert_eq!(o.mode, OpenMode::CreateNew);
         assert_eq!(o.content_type.as_deref(), Some("text/plain"));
         assert_eq!(OpenOptions::write().mode, OpenMode::Write);
+    }
+
+    #[test]
+    fn write_options_composite_fields() {
+        let opts = WriteOptions::new()
+            .with_chunk_size(32 * 1024 * 1024)
+            .with_concurrency(4)
+            .with_composite_threshold(64 * 1024 * 1024);
+        assert_eq!(opts.chunk_size, Some(32 * 1024 * 1024));
+        assert_eq!(opts.concurrency, Some(4));
+        assert_eq!(opts.composite_threshold, Some(64 * 1024 * 1024));
     }
 
     #[test]

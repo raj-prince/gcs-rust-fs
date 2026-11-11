@@ -7,12 +7,14 @@ use google_cloud_storage::model::bucket::iam_config::UniformBucketLevelAccess;
 use google_cloud_storage::model::bucket::{
     CustomPlacementConfig, HierarchicalNamespace, IamConfig,
 };
+use google_cloud_storage::model::compose_object_request::SourceObject;
 use google_cloud_storage::model::{Bucket, Folder, Object};
 use tracing::{debug, warn};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcs::backend::Backend;
 use crate::gcs::path::GcsPath;
+use crate::gcs::write::UploadSpec;
 
 /// How to create a bucket with [`GcsFs::create_bucket`](crate::GcsFs::create_bucket).
 ///
@@ -196,6 +198,61 @@ impl Backend {
             .send()
             .await
             .map_err(|e| Error::storage("move_file", src, e))
+    }
+
+    /// Assemble multiple source objects in the same bucket into a single composite object atomically.
+    pub(crate) async fn compose_objects(
+        &self,
+        sources: &[Object],
+        dst: &GcsPath,
+        spec: &UploadSpec,
+    ) -> Result<Object> {
+        debug!(%dst, sources = sources.len(), "compose_objects");
+        let mut dest_obj = Object::default()
+            .set_bucket(dst.bucket_resource())
+            .set_name(dst.object());
+        if let Some(content_type) = &spec.content_type {
+            dest_obj = dest_obj.set_content_type(content_type);
+        }
+        if !spec.metadata.is_empty() {
+            dest_obj = dest_obj.set_metadata(spec.metadata.clone());
+        }
+
+        let source_objects: Vec<SourceObject> = sources
+            .iter()
+            .map(|s| {
+                let mut src = SourceObject::new().set_name(&s.name);
+                if s.generation != 0 {
+                    src = src.set_generation(s.generation);
+                }
+                src
+            })
+            .collect();
+
+        let mut request = self
+            .control()
+            .compose_object()
+            .set_destination(dest_obj)
+            .set_source_objects(source_objects)
+            .set_delete_source_objects(true);
+
+        if spec.create_only {
+            request = request.set_if_generation_match(0i64);
+        }
+
+        request.send().await.map_err(|e| {
+            if spec.create_only
+                && crate::error::classify_storage_error(&e) == ErrorKind::PreconditionFailed
+            {
+                Error::with_source(
+                    ErrorKind::AlreadyExists,
+                    format!("{dst} already exists"),
+                    e,
+                )
+            } else {
+                Error::storage("compose_object", dst, e)
+            }
+        })
     }
 
     // ---- buckets ----------------------------------------------------------

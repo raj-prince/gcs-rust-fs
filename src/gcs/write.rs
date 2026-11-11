@@ -13,13 +13,18 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures_util::StreamExt as _;
 #[cfg(google_cloud_unstable_storage_bidi)]
 use google_cloud_storage::appendable_object_writer::AppendableObjectWriter;
 use google_cloud_storage::model::Object;
 use google_cloud_storage::streaming_source::StreamingSource;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::debug;
 #[cfg(google_cloud_unstable_storage_bidi)]
@@ -34,6 +39,230 @@ use crate::options::{OpenMode, OpenOptions, WriteMode, WriteOptions};
 /// Chunks queued between `File::write` and the upload task. The SDK keeps its
 /// own resumable buffer; this only smooths producer/consumer jitter.
 const CHANNEL_DEPTH: usize = 4;
+
+/// Default file size threshold in bytes to trigger parallel composite uploads (64 MiB).
+pub(crate) const DEFAULT_COMPOSITE_THRESHOLD: u64 = 64 * 1024 * 1024;
+
+/// Default target chunk / component size in bytes for parallel composite uploads (64 MiB).
+pub(crate) const DEFAULT_COMPOSITE_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Default maximum concurrency for parallel composite upload workers.
+pub(crate) const DEFAULT_COMPOSITE_CONCURRENCY: usize = 8;
+
+/// Maximum components allowed in a single GCS `ComposeObject` call.
+pub(crate) const MAX_COMPOSITE_COMPONENTS: usize = 32;
+
+/// Buffer size in bytes when streaming chunks from local disk slices into upload streams (2 MiB).
+pub(crate) const COMPOSITE_SLICE_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+/// Represents one slice of a local file to be uploaded as a composite component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComponentSlice {
+    pub(crate) index: usize,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+}
+
+/// Calculate balanced component slices for a composite upload.
+///
+/// Ensures that:
+/// 1. The number of components is at least 2 and at most [`MAX_COMPOSITE_COMPONENTS`].
+/// 2. Slices are balanced as evenly as possible to avoid stragglers.
+/// 3. Slices partition the exact range `[0, file_size)` without gaps or overlaps.
+pub(crate) fn calculate_component_slices(file_size: u64, chunk_size: u64) -> Vec<ComponentSlice> {
+    if file_size == 0 {
+        return Vec::new();
+    }
+    let chunk_size = chunk_size.max(1);
+    let target_parts = (file_size.div_ceil(chunk_size) as usize).clamp(2, MAX_COMPOSITE_COMPONENTS);
+
+    let base_part_size = file_size / target_parts as u64;
+    let remainder = file_size % target_parts as u64;
+
+    let mut slices = Vec::with_capacity(target_parts);
+    let mut offset = 0;
+    for index in 0..target_parts {
+        let length = base_part_size + if (index as u64) < remainder { 1 } else { 0 };
+        slices.push(ComponentSlice {
+            index,
+            offset,
+            length,
+        });
+        offset += length;
+    }
+    slices
+}
+
+#[cfg(unix)]
+fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at_offset(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let read = file.seek_read(buf, offset)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
+        }
+        let rest = &mut buf[read..];
+        buf = rest;
+        offset += read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at_offset(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
+    compile_error!("unsupported platform for positional reads");
+}
+
+/// A [`StreamingSource`] that streams a bounded byte range directly from a local file
+/// without buffering the whole slice in memory.
+pub(crate) struct FileSliceSource {
+    file: Arc<std::fs::File>,
+    slice: ComponentSlice,
+    offset: u64,
+    remaining: u64,
+    chunk_size: usize,
+}
+
+impl FileSliceSource {
+    pub(crate) fn new(file: Arc<std::fs::File>, slice: ComponentSlice) -> Self {
+        Self {
+            file,
+            offset: slice.offset,
+            remaining: slice.length,
+            chunk_size: COMPOSITE_SLICE_STREAM_CHUNK_BYTES,
+            slice,
+        }
+    }
+}
+
+impl google_cloud_storage::streaming_source::Seek for FileSliceSource {
+    type Error = std::io::Error;
+
+    async fn seek(&mut self, offset: u64) -> std::result::Result<(), Self::Error> {
+        if offset > self.slice.length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("seek offset {offset} exceeds slice length {}", self.slice.length),
+            ));
+        }
+        self.offset = self.slice.offset + offset;
+        self.remaining = self.slice.length - offset;
+        Ok(())
+    }
+}
+
+impl StreamingSource for FileSliceSource {
+    type Error = std::io::Error;
+
+    async fn next(&mut self) -> Option<std::result::Result<Bytes, Self::Error>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let to_read = (self.remaining as usize).min(self.chunk_size);
+        let file = Arc::clone(&self.file);
+        let offset = self.offset;
+
+        let res = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; to_read];
+            read_exact_at_offset(&file, &mut buf, offset)?;
+            Ok::<Bytes, std::io::Error>(Bytes::from(buf))
+        })
+        .await;
+
+        match res {
+            Ok(Ok(bytes)) => {
+                let len = bytes.len() as u64;
+                self.offset += len;
+                self.remaining -= len;
+                Some(Ok(bytes))
+            }
+            Ok(Err(e)) => Some(Err(e)),
+            Err(join_err) => Some(Err(std::io::Error::other(format!(
+                "disk read join error: {join_err}"
+            )))),
+        }
+    }
+}
+
+/// Tracks uploaded temporary component objects and ensures parallel deletion
+/// upon upload failure, cancellation, or abort.
+pub(crate) struct CompositeUploadGuard {
+    backend: Option<Backend>,
+    parts: Vec<GcsPath>,
+    disarmed: bool,
+}
+
+impl CompositeUploadGuard {
+    pub(crate) fn new(backend: Backend) -> Self {
+        Self {
+            backend: Some(backend),
+            parts: Vec::new(),
+            disarmed: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_dummy() -> Self {
+        Self {
+            backend: None,
+            parts: Vec::new(),
+            disarmed: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, path: GcsPath) {
+        self.parts.push(path);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> &[GcsPath] {
+        &self.parts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_disarmed(&self) -> bool {
+        self.disarmed
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.disarmed = true;
+        self.parts.clear();
+    }
+
+    pub(crate) async fn cleanup(&mut self) {
+        if self.disarmed || self.parts.is_empty() {
+            return;
+        }
+        let parts = std::mem::take(&mut self.parts);
+        if let Some(backend) = &self.backend {
+            futures_util::future::join_all(parts.iter().map(|p| backend.delete_object(p))).await;
+        }
+    }
+}
+
+impl Drop for CompositeUploadGuard {
+    fn drop(&mut self) {
+        if !self.disarmed && !self.parts.is_empty() {
+            if let Some(backend) = self.backend.clone() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let parts = std::mem::take(&mut self.parts);
+                    handle.spawn(async move {
+                        futures_util::future::join_all(parts.iter().map(|p| backend.delete_object(p))).await;
+                    });
+                }
+            }
+        }
+    }
+}
 
 /// Error for zonal writes when the SDK's appendable-object API is compiled out.
 #[cfg(not(google_cloud_unstable_storage_bidi))]
@@ -160,6 +389,110 @@ impl Backend {
             .send_unbuffered()
             .await
             .map_err(|e| write_error(path, spec.create_only, e))
+    }
+
+    /// Upload a local file using parallel composite uploads: slices the file into
+    /// balanced components, uploads them concurrently using zero-copy positional
+    /// streaming, and composes them into the destination object server-side.
+    pub(crate) async fn upload_composite_file(
+        &self,
+        dst: &GcsPath,
+        file_path: &Path,
+        file_size: u64,
+        spec: &UploadSpec,
+        opts: &WriteOptions,
+    ) -> Result<Object> {
+        let chunk_size = opts
+            .chunk_size
+            .unwrap_or(DEFAULT_COMPOSITE_CHUNK_SIZE as usize) as u64;
+        let concurrency = opts
+            .concurrency
+            .unwrap_or(DEFAULT_COMPOSITE_CONCURRENCY)
+            .max(1);
+
+        let slices = calculate_component_slices(file_size, chunk_size);
+        if slices.len() <= 1 {
+            let file = tokio::fs::File::open(file_path)
+                .await
+                .map_err(|e| Error::io("open_file_for_upload", file_path.display().to_string(), e))?;
+            return self.upload_file(dst, file, spec).await;
+        }
+
+        let file = std::fs::File::open(file_path)
+            .map_err(|e| Error::io("open_file_for_upload", file_path.display().to_string(), e))?;
+        let file = Arc::new(file);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let pid = std::process::id();
+        let num_slices = slices.len();
+
+        let slices_with_paths: Vec<(ComponentSlice, GcsPath)> = slices
+            .into_iter()
+            .map(|s| {
+                let part_name = format!("{}.gstmp.{}.{}.{}", dst.object(), pid, nanos, s.index);
+                let part_path = GcsPath::new(dst.bucket(), part_name)?;
+                Ok((s, part_path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let guard = Arc::new(Mutex::new(CompositeUploadGuard::new(self.clone())));
+
+        let mut stream = tokio_stream::iter(slices_with_paths)
+            .map(|(slice, part_path)| {
+                let backend = self.clone();
+                let file = Arc::clone(&file);
+                let guard = Arc::clone(&guard);
+                async move {
+                    let part_source = FileSliceSource::new(file, slice);
+                    let req = backend
+                        .storage()
+                        .write_object(part_path.bucket_resource(), part_path.object(), part_source);
+                    let obj = req
+                        .send_unbuffered()
+                        .await
+                        .map_err(|e| write_error(&part_path, false, e))?;
+                    guard.lock().await.push(part_path);
+                    Ok::<_, Error>((slice.index, obj))
+                }
+            })
+            .buffer_unordered(concurrency);
+
+        let mut component_objects: Vec<Option<Object>> = vec![None; num_slices];
+        while let Some(res) = stream.next().await {
+            match res {
+                Ok((idx, obj)) => {
+                    component_objects[idx] = Some(obj);
+                }
+                Err(e) => {
+                    guard.lock().await.cleanup().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        let sources: Vec<Object> = component_objects
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                opt.ok_or_else(|| {
+                    Error::new(ErrorKind::Other, format!("part {i} was not uploaded"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let compose_res = self.compose_objects(&sources, dst, spec).await;
+        match compose_res {
+            Ok(obj) => {
+                guard.lock().await.disarm();
+                Ok(obj)
+            }
+            Err(e) => {
+                guard.lock().await.cleanup().await;
+                Err(e)
+            }
+        }
     }
 
     /// Start a streaming upload for `open(.., write)`.
@@ -423,5 +756,170 @@ impl AppendableWriter {
                 size: u64::try_from(persisted).unwrap_or(self.written),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_slices_for_200_mib() {
+        let size = 200 * 1024 * 1024;
+        let chunk = 64 * 1024 * 1024;
+        let slices = calculate_component_slices(size, chunk);
+        assert_eq!(slices.len(), 4);
+        for s in &slices {
+            assert_eq!(s.length, 50 * 1024 * 1024);
+        }
+        assert_eq!(slices[0].offset, 0);
+        assert_eq!(slices[1].offset, 50 * 1024 * 1024);
+        assert_eq!(slices[2].offset, 100 * 1024 * 1024);
+        assert_eq!(slices[3].offset, 150 * 1024 * 1024);
+
+        let total: u64 = slices.iter().map(|s| s.length).sum();
+        assert_eq!(total, size);
+    }
+
+    #[test]
+    fn component_slices_edge_cases() {
+        // Empty file
+        assert!(calculate_component_slices(0, 64 * 1024 * 1024).is_empty());
+
+        // File smaller than chunk size is clamped to min 2 parts
+        let slices = calculate_component_slices(100, 64);
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].length, 50);
+        assert_eq!(slices[1].length, 50);
+        assert_eq!(slices[1].offset, 50);
+
+        // Uneven remainder distribution
+        let slices = calculate_component_slices(101, 50);
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].length, 34);
+        assert_eq!(slices[1].length, 34);
+        assert_eq!(slices[2].length, 33);
+        let total: u64 = slices.iter().map(|s| s.length).sum();
+        assert_eq!(total, 101);
+
+        // Huge file clamped to MAX_COMPOSITE_COMPONENTS
+        let huge_size = 5 * 1024 * 1024 * 1024; // 5 GiB
+        let slices = calculate_component_slices(huge_size, 64 * 1024 * 1024);
+        assert_eq!(slices.len(), MAX_COMPOSITE_COMPONENTS);
+        let total: u64 = slices.iter().map(|s| s.length).sum();
+        assert_eq!(total, huge_size);
+    }
+
+    #[tokio::test]
+    async fn file_slice_source_reads_arbitrary_ranges() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "slice_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+        }
+
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let slice = ComponentSlice {
+            index: 0,
+            offset: 1_234,
+            length: 4_567,
+        };
+        let mut source = FileSliceSource::new(file, slice);
+        // Overwrite chunk size to 1024 to exercise multiple chunk iterations
+        source.chunk_size = 1024;
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = source.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(collected.len(), 4_567);
+        assert_eq!(collected, &data[1_234..1_234 + 4_567]);
+    }
+
+    #[tokio::test]
+    async fn file_slice_source_seek() {
+        use google_cloud_storage::streaming_source::Seek as _;
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "slice_seek_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+        }
+
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let slice = ComponentSlice {
+            index: 0,
+            offset: 1_000,
+            length: 2_000,
+        };
+        let mut source = FileSliceSource::new(file, slice);
+        source.chunk_size = 500;
+
+        // Read first 500 bytes
+        let first = source.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), 500);
+        assert_eq!(&first[..], &data[1000..1500]);
+
+        // Seek back to 200 (relative to slice)
+        source.seek(200).await.unwrap();
+        let second = source.next().await.unwrap().unwrap();
+        assert_eq!(second.len(), 500);
+        assert_eq!(&second[..], &data[1200..1700]);
+
+        // Seek past end errors
+        assert!(source.seek(2500).await.is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn composite_upload_guard_lifecycle() {
+        let p1 = GcsPath::new("my-bucket", "obj.gstmp.1.1.0").unwrap();
+        let p2 = GcsPath::new("my-bucket", "obj.gstmp.1.1.1").unwrap();
+
+        let mut guard = CompositeUploadGuard::new_dummy();
+        assert!(!guard.is_disarmed());
+        assert!(guard.parts().is_empty());
+
+        guard.push(p1.clone());
+        guard.push(p2.clone());
+        assert_eq!(guard.parts().len(), 2);
+        assert_eq!(guard.parts()[0], p1);
+        assert_eq!(guard.parts()[1], p2);
+
+        // Cleanup before disarm clears parts
+        guard.cleanup().await;
+        assert!(guard.parts().is_empty());
+
+        // Disarm sets flag
+        guard.push(p1);
+        assert!(!guard.is_disarmed());
+        guard.disarm();
+        assert!(guard.is_disarmed());
+        assert!(guard.parts().is_empty());
+
+        // Cleanup after disarm is a no-op
+        guard.cleanup().await;
     }
 }
