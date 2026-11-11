@@ -64,3 +64,4 @@ The filesystem SHALL ensure that temporary component objects are deleted from th
 #### Scenario: Cleanup on upload failure or cancellation
 - **WHEN** any component upload fails or the upload future is cancelled
 - **THEN** any component parts already written to the bucket are deleted
+
