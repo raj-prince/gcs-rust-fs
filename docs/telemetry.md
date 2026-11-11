@@ -54,7 +54,7 @@ Add `gcs-rust-fs` to `Cargo.toml` with the `otlp` feature enabled:
 
 ```toml
 [dependencies]
-gcs-rust-fs = { version = "0.1.2", features = ["otlp"] }
+gcs-rust-fs = { version = "0.1.3", features = ["otlp"] }
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.33", features = ["metrics", "grpc-tonic"] }
